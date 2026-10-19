@@ -1,4 +1,4 @@
-import { Address, Transaction } from 'stellar-sdk';
+import { Address, Transaction } from "stellar-sdk";
 
 // Vault Types
 export interface VaultInfo {
@@ -79,6 +79,12 @@ export interface RebalanceHistory {
   apyBefore: number;
   apyAfter: number;
   success: boolean;
+}
+
+export interface PoolApyRecord {
+  apyBps: number;
+  updatedAt: number;
+  updatedBy: string;
 }
 
 // Reward Distributor Types
@@ -278,7 +284,7 @@ export interface TransactionResult {
 
 // Configuration Types
 export interface NetworkConfig {
-  network: 'testnet' | 'mainnet' | 'futurenet';
+  network: "testnet" | "mainnet" | "futurenet";
   horizonUrl: string;
   sorobanRpcUrl: string;
   /**
@@ -312,11 +318,14 @@ export interface TransactionSigner {
   /** Sign `transaction` for `networkPassphrase` and return the signed tx. */
   signTransaction(
     transaction: Transaction,
-    networkPassphrase: string
+    networkPassphrase: string,
   ): Promise<Transaction>;
 }
 
-export type VaultClientConfig = Pick<NetworkConfig, 'network' | 'sorobanRpcUrl'>;
+export type VaultClientConfig = Pick<
+  NetworkConfig,
+  "network" | "sorobanRpcUrl"
+>;
 
 export interface VaultConfig {
   vaultAddress: Address;
@@ -329,36 +338,48 @@ export interface VaultConfig {
 
 // Error Types
 export class VaultError extends Error {
-  constructor(message: string, public code?: string) {
+  constructor(
+    message: string,
+    public code?: string,
+  ) {
     super(message);
-    this.name = 'VaultError';
+    this.name = "VaultError";
   }
 }
 
 export class RebalanceError extends Error {
-  constructor(message: string, public code?: string) {
+  constructor(
+    message: string,
+    public code?: string,
+  ) {
     super(message);
-    this.name = 'RebalanceError';
+    this.name = "RebalanceError";
   }
 }
 
 export class RewardError extends Error {
-  constructor(message: string, public code?: string) {
+  constructor(
+    message: string,
+    public code?: string,
+  ) {
     super(message);
-    this.name = 'RewardError';
+    this.name = "RewardError";
   }
 }
 
 export class StrategyError extends Error {
-  constructor(message: string, public code?: string) {
+  constructor(
+    message: string,
+    public code?: string,
+  ) {
     super(message);
-    this.name = 'StrategyError';
+    this.name = "StrategyError";
   }
 }
 
 // Utility Types
-export type RiskLevel = 'conservative' | 'balanced' | 'aggressive';
-export type ApprovalType = 'initial' | 'update' | 'removal';
+export type RiskLevel = "conservative" | "balanced" | "aggressive";
+export type ApprovalType = "initial" | "update" | "removal";
 
 export interface TimeInterval {
   start: number;
@@ -368,7 +389,7 @@ export interface TimeInterval {
 export interface PaginationOptions {
   limit?: number;
   offset?: number;
-  order?: 'asc' | 'desc';
+  order?: "asc" | "desc";
 }
 
 // Performance History Types (Issue #128)
@@ -435,7 +456,7 @@ export interface HarvestEfficiencyMetrics {
 
 // Event Types
 export interface VaultEvent {
-  type: 'deposit' | 'withdraw' | 'harvest' | 'pause' | 'unpause';
+  type: "deposit" | "withdraw" | "harvest" | "pause" | "unpause";
   vault: Address;
   user?: Address;
   amount?: bigint;
@@ -444,7 +465,7 @@ export interface VaultEvent {
 }
 
 export interface RebalanceEvent {
-  type: 'proposal' | 'execution' | 'failure';
+  type: "proposal" | "execution" | "failure";
   strategy: number;
   fromPool?: Address;
   toPool?: Address;
@@ -454,7 +475,7 @@ export interface RebalanceEvent {
 }
 
 export interface RewardEvent {
-  type: 'distribution' | 'claim' | 'expiry';
+  type: "distribution" | "claim" | "expiry";
   vault: Address;
   user?: Address;
   amount?: bigint;
