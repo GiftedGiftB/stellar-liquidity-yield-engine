@@ -13,11 +13,41 @@
 // occur on-chain.
 #![allow(ambiguous_glob_reexports)]
 
-use soroban_sdk::{contract, contractimpl, Address, Env, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, Address, Env, Symbol};
 
-/// Panics with the given error's debug representation if `cond` is false.
+/// Typed failures of the umbrella engine contract.
+///
+/// Every expected invalid input fails with one of these instead of an opaque
+/// string panic, so a caller can tell the cases apart and react to them.
+#[contracterror]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EngineError {
+    /// The caller is not the stored admin.
+    Unauthorized = 1,
+    /// The contract is paused and refuses the operation.
+    Paused = 2,
+    /// The contract has not been initialized yet.
+    NotInitialized = 3,
+}
+
+/// Fails with a typed contract error when `$cond` is false.
+///
+/// The typed form takes the `Env` first because that is what turns the failure
+/// into a distinguishable contract error code rather than an opaque panic:
+///
+/// ```ignore
+/// require!(env, amount > 0, VaultError::InvalidAmount);
+/// ```
+///
+/// The two-argument form is retained for callers that only have a message; it
+/// still panics opaquely and should not be used for new code.
 #[allow(unused_macros)]
 macro_rules! require {
+    ($env:expr, $cond:expr, $err:expr) => {
+        if !$cond {
+            $env.panic_with_error($err)
+        }
+    };
     ($cond:expr, $err:expr) => {
         if !$cond {
             panic!("{:?}", $err)
@@ -139,11 +169,14 @@ impl StellarLiquidityYieldEngine {
     }
 
     /// Get admin address
+    ///
+    /// Fails with [`EngineError::NotInitialized`] when the contract has not
+    /// been initialized, instead of an opaque storage panic.
     pub fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "admin"))
-            .unwrap()
+            .unwrap_or_else(|| env.panic_with_error(EngineError::NotInitialized))
     }
 
     /// Update admin
@@ -155,19 +188,23 @@ impl StellarLiquidityYieldEngine {
     }
 
     /// Get strategy registry address
+    ///
+    /// Fails with [`EngineError::NotInitialized`] when unset.
     pub fn get_strategy_registry(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "strategy_registry"))
-            .unwrap()
+            .unwrap_or_else(|| env.panic_with_error(EngineError::NotInitialized))
     }
 
     /// Get reward distributor address
+    ///
+    /// Fails with [`EngineError::NotInitialized`] when unset.
     pub fn get_reward_distributor(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "reward_distributor"))
-            .unwrap()
+            .unwrap_or_else(|| env.panic_with_error(EngineError::NotInitialized))
     }
 
     /// Update the strategy registry contract address (admin only)
@@ -203,7 +240,7 @@ impl StellarLiquidityYieldEngine {
     /// Panic unless the contract is unpaused.
     fn require_not_paused(env: &Env) {
         if Self::is_paused(env.clone()) {
-            panic!("contract is paused");
+            env.panic_with_error(EngineError::Paused);
         }
     }
 
@@ -211,7 +248,7 @@ impl StellarLiquidityYieldEngine {
     fn require_admin(env: &Env, caller: Address) {
         let admin = Self::get_admin(env.clone());
         if caller != admin {
-            panic!("unauthorized: admin required");
+            env.panic_with_error(EngineError::Unauthorized);
         }
     }
 }

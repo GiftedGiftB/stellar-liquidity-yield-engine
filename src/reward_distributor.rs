@@ -155,6 +155,10 @@ pub enum RewardError {
     AlreadyInitialized = 11,
     /// The stream's `claim_deadline` has passed; it can no longer be claimed.
     ClaimDeadlinePassed = 12,
+    /// The user has nothing accrued to claim.
+    NoPendingRewards = 13,
+    /// The emergency withdrawal has already been completed.
+    EmergencyWithdrawalAlreadyCompleted = 14,
 }
 
 #[contractimpl]
@@ -461,7 +465,7 @@ impl MultiRewardDistributor {
 
             let pending = reward_debt.pending_rewards;
             if pending <= 0 {
-                panic!("no pending rewards");
+                panic_with_error!(env, RewardError::NoPendingRewards);
             }
 
             // Calculate treasury fee (0.25%)
@@ -571,7 +575,7 @@ impl MultiRewardDistributor {
         let mut withdrawal: EmergencyWithdrawal = env.storage().instance().get(&key).unwrap();
 
         if withdrawal.completed {
-            panic!("already completed");
+            panic_with_error!(&env, RewardError::EmergencyWithdrawalAlreadyCompleted);
         }
 
         withdrawal.completed = true;
@@ -1530,5 +1534,44 @@ mod tests {
             client.get_pending_rewards(&user, &indices).get(0).unwrap(),
             pending
         );
+    }
+
+    // ==================== Typed error paths ====================
+
+    #[test]
+    fn test_claim_with_nothing_accrued_is_typed() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000);
+        let (_admin, _treasury, client, _token_admin, _token_client) = setup_stream(&env, 1_000, 0);
+
+        // No time has passed, so nothing accrued for this fresh user.
+        let user = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let indices = Vec::from_array(&env, [0u32]);
+        let err = client
+            .try_claim_rewards(&user, &vault, &indices, &None::<Address>)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RewardError::NoPendingRewards.into());
+    }
+
+    #[test]
+    fn test_complete_emergency_withdrawal_twice_is_typed() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (_admin, _treasury, _swap_router, client, _token_client) = setup(&env);
+
+        let user = Address::generate(&env);
+        let vault = Address::generate(&env);
+
+        // A withdrawal has to be requested before it can be completed.
+        client.emergency_withdraw(&user, &vault, &100);
+        client.complete_emergency_withdrawal(&user, &vault);
+        let err = client
+            .try_complete_emergency_withdrawal(&user, &vault)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RewardError::EmergencyWithdrawalAlreadyCompleted.into());
     }
 }
