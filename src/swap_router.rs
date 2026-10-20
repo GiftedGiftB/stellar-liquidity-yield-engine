@@ -109,6 +109,12 @@ pub enum SwapError {
     PoolNotFound = 12,
 }
 
+impl From<SwapError> for soroban_sdk::Error {
+    fn from(e: SwapError) -> Self {
+        soroban_sdk::Error::from_contract_error(e as u32)
+    }
+}
+
 /// SwapRouter contract for Stellar DEX integration
 #[contract]
 pub struct SwapRouter;
@@ -133,6 +139,9 @@ impl SwapRouter {
         // Initialize empty pools map
         let pools: Map<Address, PoolInfo> = Map::new(&env);
         env.storage().instance().set(&Symbol::new(&env, "pools"), &pools);
+        
+        // Initialize oracle pause state to false
+        env.storage().instance().set(&Symbol::new(&env, "oracle_paused"), &false);
     }
 
     // ==================== Pool Management ====================
@@ -178,6 +187,8 @@ impl SwapRouter {
         reserve_a: i128,
         reserve_b: i128,
     ) -> Result<(), SwapError> {
+        Self::require_oracle_not_paused(&env);
+        
         let mut pools = Self::get_pools(&env);
         
         if let Some(mut pool) = pools.get(&pool_address) {
@@ -491,6 +502,30 @@ impl SwapRouter {
         env.storage().instance().set(&Symbol::new(&env, "paused"), &false);
     }
 
+    /// Pause oracle ingestion (admin only)
+    pub fn pause_oracle(env: Env, admin: Address) {
+        Self::require_admin_ref(&env, &admin);
+        env.storage().instance().set(&Symbol::new(&env, "oracle_paused"), &true);
+        env.events()
+            .publish((Symbol::new(&env, "oracle_paused"),), (admin,));
+    }
+
+    /// Unpause oracle ingestion (admin only)
+    pub fn unpause_oracle(env: Env, admin: Address) {
+        Self::require_admin_ref(&env, &admin);
+        env.storage().instance().set(&Symbol::new(&env, "oracle_paused"), &false);
+        env.events()
+            .publish((Symbol::new(&env, "oracle_unpaused"),), (admin,));
+    }
+
+    /// Check if oracle ingestion is paused
+    pub fn is_oracle_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "oracle_paused"))
+            .unwrap_or(false)
+    }
+
     /// Retry failed swaps (admin only)
     pub fn retry_failed_swaps(env: Env, admin: Address) -> u32 {
         Self::require_admin(&env, admin);
@@ -545,12 +580,25 @@ impl SwapRouter {
         require!(caller == admin, SwapError::Unauthorized);
     }
 
+    fn require_admin_ref(env: &Env, caller: &Address) {
+        let admin = Self::get_admin(env.clone());
+        require!(caller == &admin, SwapError::Unauthorized);
+    }
+
     fn require_not_paused(env: &Env) {
         let paused = env.storage()
             .instance()
             .get::<_, bool>(&Symbol::new(env, "paused"))
             .unwrap_or(false);
         require!(!paused, SwapError::Unauthorized);
+    }
+
+    fn require_oracle_not_paused(env: &Env) {
+        let oracle_paused = env.storage()
+            .instance()
+            .get::<_, bool>(&Symbol::new(env, "oracle_paused"))
+            .unwrap_or(false);
+        require!(!oracle_paused, SwapError::Unauthorized);
     }
 
     fn get_admin(env: Env) -> Address {
@@ -1068,5 +1116,154 @@ impl SwapRouter {
             &(id + 1),
         );
         id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    #[test]
+    fn test_oracle_pause_blocks_update_pool_reserves() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let xlm_token = Address::generate(&env);
+
+        SwapRouter::initialize(env.clone(), admin.clone(), treasury, xlm_token);
+
+        // Add a pool
+        let pool_address = Address::generate(&env);
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        SwapRouter::add_pool(
+            env.clone(),
+            admin.clone(),
+            pool_address.clone(),
+            token_a,
+            token_b,
+            30, // 0.3% fee
+            false,
+        );
+
+        // Pause oracle ingestion
+        SwapRouter::pause_oracle(env.clone(), admin.clone());
+
+        // Try to update pool reserves - should fail
+        let result = SwapRouter::update_pool_reserves(
+            env.clone(),
+            pool_address,
+            1000,
+            2000,
+        );
+        assert!(result.is_err());
+
+        // Unpause oracle ingestion
+        SwapRouter::unpause_oracle(env.clone(), admin.clone());
+
+        // Now update should succeed
+        let result = SwapRouter::update_pool_reserves(
+            env.clone(),
+            pool_address,
+            1000,
+            2000,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_oracle_pause_unpause() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let xlm_token = Address::generate(&env);
+
+        SwapRouter::initialize(env.clone(), admin.clone(), treasury, xlm_token);
+
+        // Initially not paused
+        assert!(!SwapRouter::is_oracle_paused(env.clone()));
+
+        // Pause oracle
+        SwapRouter::pause_oracle(env.clone(), admin.clone());
+        assert!(SwapRouter::is_oracle_paused(env.clone()));
+
+        // Unpause oracle
+        SwapRouter::unpause_oracle(env.clone(), admin.clone());
+        assert!(!SwapRouter::is_oracle_paused(env.clone()));
+    }
+
+    #[test]
+    fn test_oracle_pause_requires_admin() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let xlm_token = Address::generate(&env);
+
+        SwapRouter::initialize(env.clone(), admin, treasury, xlm_token);
+
+        // Try to pause with non-admin - should panic
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SwapRouter::pause_oracle(env.clone(), non_admin.clone());
+        }));
+        assert!(result.is_err());
+
+        // Try to unpause with non-admin - should panic
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SwapRouter::unpause_oracle(env.clone(), non_admin.clone());
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_oracle_pause_independent_from_global_pause() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let xlm_token = Address::generate(&env);
+
+        SwapRouter::initialize(env.clone(), admin.clone(), treasury, xlm_token);
+
+        // Add a pool
+        let pool_address = Address::generate(&env);
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        SwapRouter::add_pool(
+            env.clone(),
+            admin.clone(),
+            pool_address.clone(),
+            token_a,
+            token_b,
+            30,
+            false,
+        );
+
+        // Pause oracle only
+        SwapRouter::pause_oracle(env.clone(), admin.clone());
+        assert!(SwapRouter::is_oracle_paused(env.clone()));
+
+        // Oracle update should fail
+        let result = SwapRouter::update_pool_reserves(
+            env.clone(),
+            pool_address.clone(),
+            1000,
+            2000,
+        );
+        assert!(result.is_err());
+
+        // Unpause oracle
+        SwapRouter::unpause_oracle(env.clone(), admin.clone());
+        assert!(!SwapRouter::is_oracle_paused(env.clone()));
+
+        // Oracle update should now succeed
+        let result = SwapRouter::update_pool_reserves(
+            env.clone(),
+            pool_address,
+            1000,
+            2000,
+        );
+        assert!(result.is_ok());
     }
 }

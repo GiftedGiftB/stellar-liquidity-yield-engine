@@ -1,5 +1,6 @@
 import { Address, Horizon } from 'stellar-sdk';
 import axios from 'axios';
+import { WriteRateLimiter } from './utils/rateLimiter';
 
 export interface Opportunity {
   pool_id: string;
@@ -9,6 +10,7 @@ export interface Opportunity {
   net_profit: bigint;
   apy_delta: number;
   recommended: boolean;
+  confidence: number; // 0-100, confidence score based on data age and sample size
 }
 
 export interface PoolMetrics {
@@ -19,6 +21,7 @@ export interface PoolMetrics {
   reserve_b: bigint;
   volatility_24h: number;
   volatility_7d: number;
+  confidence: number; // 0-100, confidence score based on data age and sample size
 }
 
 /**
@@ -27,6 +30,8 @@ export interface PoolMetrics {
 export interface VolatilityMetrics {
   volatility_24h: number;
   volatility_7d: number;
+  sampleSize_24h: number;
+  sampleSize_7d: number;
 }
 
 /**
@@ -38,6 +43,30 @@ export interface VolatilityMetrics {
  */
 export interface VolatilitySource {
   getVolatility(poolId: string): Promise<VolatilityMetrics | null>;
+}
+
+/**
+ * Calculate confidence score based on sample size and data recency.
+ * Returns a value between 0-100, where higher values indicate higher confidence.
+ *
+ * Confidence is computed as:
+ * - Sample size component: More samples = higher confidence (capped at 50 samples)
+ * - Age component: More recent data = higher confidence (exponential decay)
+ */
+export function calculateConfidence(
+  sampleSize: number,
+  ageSeconds: number,
+  maxSampleSize: number = 50,
+  halfLifeSeconds: number = 86400, // 24 hours
+): number {
+  // Sample size component: 0-50 points maps to 0-50 confidence
+  const sampleScore = Math.min(sampleSize / maxSampleSize, 1) * 50;
+  
+  // Age component: exponential decay based on half-life
+  const ageScore = Math.pow(0.5, ageSeconds / halfLifeSeconds) * 50;
+  
+  // Combined confidence score
+  return Math.min(Math.max(sampleScore + ageScore, 0), 100);
 }
 
 /**
@@ -130,6 +159,8 @@ export class HorizonVolatilitySource implements VolatilitySource {
       return {
         volatility_24h: volatility24h,
         volatility_7d: volatility7d,
+        sampleSize_24h: recentPrices.length,
+        sampleSize_7d: windowPrices.length,
       };
     } catch (error) {
       console.error(`Failed to fetch price history for pool ${poolId}:`, error);
@@ -212,6 +243,13 @@ export class ArbitrageScanner {
         return null;
       }
 
+      // Calculate confidence based on sample size (24h window is most relevant)
+      // and data age (assuming most recent trade is within 24h for high confidence)
+      const confidence = calculateConfidence(
+        volatility.sampleSize_24h,
+        0, // Age is 0 since we're using the most recent window
+      );
+
       return {
         pool_id: pool.id,
         current_apy: estimate_apy,
@@ -220,6 +258,7 @@ export class ArbitrageScanner {
         reserve_b,
         volatility_24h: Math.round(volatility.volatility_24h),
         volatility_7d: Math.round(volatility.volatility_7d),
+        confidence: Math.round(confidence),
       };
     } catch (error) {
       return null;
@@ -261,6 +300,7 @@ export class ArbitrageScanner {
           net_profit,
           apy_delta,
           recommended: apy_delta >= minApyDelta * 2, // Strong signal if 2x threshold
+          confidence: pool.confidence,
         });
       }
     }
@@ -272,11 +312,28 @@ export class ArbitrageScanner {
   }
 }
 
+export interface ArbitrageExecutorOptions {
+  /**
+   * Paces transaction submissions so a burst of work does not trip the RPC
+   * node's rate limits. When omitted, a default limiter (one write at a time,
+   * 1s apart) is used.
+   */
+  writeLimiter?: WriteRateLimiter;
+}
+
 export class ArbitrageExecutor {
   private horizonServer: Horizon.Server;
+  private readonly writeLimiter: WriteRateLimiter;
 
-  constructor(horizonUrl: string = 'https://horizon.stellar.org') {
+  constructor(horizonUrl: string = 'https://horizon.stellar.org', options: ArbitrageExecutorOptions = {}) {
     this.horizonServer = new Horizon.Server(horizonUrl);
+    this.writeLimiter =
+      options.writeLimiter ?? new WriteRateLimiter({ minIntervalMs: 1000, maxConcurrent: 1 });
+  }
+
+  /** Write-pacing counters for this executor. */
+  getWriteLimiterStats() {
+    return this.writeLimiter.stats();
   }
 
   /**
@@ -330,22 +387,26 @@ export class ArbitrageExecutor {
         };
       }
 
-      // In production, this would:
-      // 1. Create multi-operation transaction (withdraw + deposit)
-      // 2. Sign with provided private key
-      // 3. Submit to network
-      // 4. Wait for confirmation
+      // Pace the submission: bursts of arbitrage are the most likely trigger
+      // for node-side throttling, so the actual write goes through the limiter.
+      return await this.writeLimiter.schedule(async () => {
+        // In production, this would:
+        // 1. Create multi-operation transaction (withdraw + deposit)
+        // 2. Sign with provided private key
+        // 3. Submit to network
+        // 4. Wait for confirmation
 
-      console.log(`Executing arbitrage: ${currentPoolId} -> ${opportunity.pool_id}`);
-      console.log(`Amount: ${amount}, Projected APY gain: ${opportunity.apy_delta} bp`);
+        console.log(`Executing arbitrage: ${currentPoolId} -> ${opportunity.pool_id}`);
+        console.log(`Amount: ${amount}, Projected APY gain: ${opportunity.apy_delta} bp`);
 
-      // Simulated successful execution
-      const txHash = `tx_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        // Simulated successful execution
+        const txHash = `tx_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-      return {
-        success: true,
-        transactionHash: txHash,
-      };
+        return {
+          success: true,
+          transactionHash: txHash,
+        };
+      });
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       return {
@@ -385,7 +446,7 @@ export class ArbitrageOptimizer {
   }
 
   /**
-   * Rank opportunities by risk-adjusted return
+   * Rank opportunities by risk-adjusted return with confidence weighting
    */
   static rankOpportunities(
     opportunities: Opportunity[],
@@ -394,9 +455,18 @@ export class ArbitrageOptimizer {
     return opportunities.sort((a, b) => {
       // Risk-adjusted score = APY delta - (IL risk * risk factor)
       const riskFactor = 0.1 * (11 - riskTolerance);
-      const scoreA = a.apy_delta - a.il_risk * riskFactor;
-      const scoreB = b.apy_delta - b.il_risk * riskFactor;
-      return scoreB - scoreA;
+      const baseScoreA = a.apy_delta - a.il_risk * riskFactor;
+      const baseScoreB = b.apy_delta - b.il_risk * riskFactor;
+
+      // Apply confidence weighting: higher confidence = higher effective score
+      // Confidence is 0-100, so we normalize to 0-1 and use as a multiplier
+      const confidenceWeightA = a.confidence / 100;
+      const confidenceWeightB = b.confidence / 100;
+
+      const weightedScoreA = baseScoreA * confidenceWeightA;
+      const weightedScoreB = baseScoreB * confidenceWeightB;
+
+      return weightedScoreB - weightedScoreA;
     });
   }
 

@@ -1,6 +1,8 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token::TokenClient,
     Address, Env, Symbol, Vec,
+    contract, contractimpl, contracttype, token::TokenClient, unwrap::UnwrapOptimized, Address,
+    Env, Map, Symbol, Vec,
 };
 
 /// Typed failures of the yield vault.
@@ -74,6 +76,27 @@ pub struct UserPosition {
     pub deposited_amount_b: i128,
 }
 
+/// An economic-parameter change waiting out its time lock.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingAdminAction {
+    Prices(i128, i128),
+    MinDepositAmounts(i128, i128),
+    MinWithdrawShares(i128),
+    Treasury(Address),
+    TimelockDelay(u64),
+}
+
+/// A queued change with the timestamp at which it becomes executable.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAction {
+    pub id: u64,
+    pub action: PendingAdminAction,
+    pub proposer: Address,
+    pub executable_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultMetrics {
@@ -93,7 +116,7 @@ const SECONDS_PER_YEAR: u128 = 31_536_000;
 
 /// Default minimum deposit per leg: 0, because a single-leg deposit is a valid
 /// operation. The combined deposit must still be positive, and an admin can
-/// raise either leg with `set_min_deposit_amounts`.
+/// raise either leg through the timelocked `propose_set_min_deposit_amounts`.
 pub const DEFAULT_MIN_DEPOSIT: i128 = 0;
 
 /// Smallest accepted withdrawal, in shares, when the admin has not configured a
@@ -103,6 +126,13 @@ pub const DEFAULT_MIN_WITHDRAW_SHARES: i128 = 1;
 /// A tracked balance at or below this is dust. It is swept into a full exit
 /// instead of being stranded in the vault forever.
 pub const DUST_THRESHOLD: i128 = 1;
+
+/// Default delay applied to admin changes of economic parameters: 48 hours.
+///
+/// This gives depositors and integrators a window to see a pending change - and
+/// to exit - before it takes effect. The admin can change the delay, but only
+/// through the timelock itself, so it cannot be shortened instantly.
+pub const DEFAULT_TIMELOCK_DELAY: u64 = 48 * 60 * 60;
 
 // The contract's entrypoints are exported only when the vault itself is the
 // contract being deployed. The rebalance engine depends on this module's types
@@ -147,6 +177,16 @@ impl YieldVault {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "paused"), &false);
+
+        // Time lock for economic-parameter changes, and the queue of changes
+        // waiting out that delay.
+        env.storage().instance().set(
+            &Symbol::new(&env, "timelock_delay"),
+            &DEFAULT_TIMELOCK_DELAY,
+        );
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "next_action_id"), &1u64);
 
         // Emergency multisig state: the emergency signer set starts empty and
         // must be configured by the admin; threshold defaults to 3 approvals.
@@ -530,25 +570,28 @@ impl YieldVault {
         )
     }
 
-    /// Set the minimum accepted deposit per leg (admin only). A minimum of 0
-    /// keeps single-leg deposits open; the combined deposit must be positive
-    /// either way.
-    pub fn set_min_deposit_amounts(env: Env, admin: Address, min_a: i128, min_b: i128) {
+    /// Queue a change to the minimum accepted deposit per leg (admin only).
+    ///
+    /// The change is queued rather than applied: it becomes executable once the
+    /// timelock delay has elapsed. A minimum of 0 keeps single-leg deposits
+    /// open; the combined deposit must be positive either way.
+    ///
+    /// Returns the id of the queued action.
+    pub fn propose_set_min_deposit_amounts(
+        env: Env,
+        admin: Address,
+        min_a: i128,
+        min_b: i128,
+    ) -> u64 {
         Self::require_admin(&env, admin.clone());
         require!(&env, min_a >= 0, VaultError::NegativeMinimumDeposit);
         require!(&env, min_b >= 0, VaultError::NegativeMinimumDeposit);
 
-        env.storage()
-            .instance()
-            .set(&Symbol::new(&env, "min_deposit_a"), &min_a);
-        env.storage()
-            .instance()
-            .set(&Symbol::new(&env, "min_deposit_b"), &min_b);
-
-        env.events().publish(
-            (Symbol::new(&env, "min_deposit_updated"),),
-            (admin, min_a, min_b),
-        );
+        Self::enqueue(
+            env,
+            admin,
+            PendingAdminAction::MinDepositAmounts(min_a, min_b),
+        )
     }
 
     /// Smallest accepted withdrawal, in shares
@@ -559,20 +602,19 @@ impl YieldVault {
             .unwrap_or(DEFAULT_MIN_WITHDRAW_SHARES)
     }
 
-    /// Set the smallest accepted withdrawal in shares (admin only). Must be
-    /// positive so a zero-share withdrawal is always rejected.
-    pub fn set_min_withdraw_shares(env: Env, admin: Address, min_shares: i128) {
+    /// Queue a change to the smallest accepted withdrawal in shares (admin
+    /// only). Must be positive so a zero-share withdrawal is always rejected.
+    ///
+    /// Returns the id of the queued action.
+    pub fn propose_set_min_withdraw_shares(env: Env, admin: Address, min_shares: i128) -> u64 {
         Self::require_admin(&env, admin.clone());
         require!(&env, min_shares > 0, VaultError::MinSharesMustBePositive);
 
-        env.storage()
-            .instance()
-            .set(&Symbol::new(&env, "min_withdraw_shares"), &min_shares);
-
-        env.events().publish(
-            (Symbol::new(&env, "min_withdraw_shares_updated"),),
-            (admin, min_shares),
-        );
+        Self::enqueue(
+            env,
+            admin,
+            PendingAdminAction::MinWithdrawShares(min_shares),
+        )
     }
 
     /// Get vault information
@@ -636,11 +678,16 @@ impl YieldVault {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "metrics"), &metrics);
+    /// Queue a change to the USD prices (scaled) used for TVL (admin only).
+    ///
+    /// Prices are an economic parameter: they change the value backing every
+    /// share, so the change is queued behind the timelock. Returns the id of the
+    /// queued action.
+    pub fn propose_set_prices(env: Env, admin: Address, price_a: i128, price_b: i128) -> u64 {
+        Self::require_admin(&env, admin.clone());
+        require!(price_a >= 0 && price_b >= 0, "price must not be negative");
 
-        env.events().publish(
-            (Symbol::new(&env, "prices_updated"),),
-            (admin, price_a, price_b),
-        );
+        Self::enqueue(env, admin, PendingAdminAction::Prices(price_a, price_b))
     }
 
     /// Get the currently configured token prices as (price_a, price_b).
@@ -658,23 +705,89 @@ impl YieldVault {
             .unwrap_or_else(|| env.panic_with_error(VaultError::NotInitialized))
     }
 
-    /// Point protocol fee routing at a new treasury/DAO address (admin only).
+    /// Queue a change to the treasury/DAO address that receives protocol fees
+    /// (admin only).
     ///
-    /// The treasury is set at initialization like `reward_distributor` does, but it
-    /// can be rotated so a DAO can move its own treasury without redeploying the
-    /// vault. Only affects fees collected after the call.
-    pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
+    /// The treasury is set at initialization like `reward_distributor` does, but
+    /// it can be rotated so a DAO can move its own treasury without redeploying
+    /// the vault. Because fee routing is an economic parameter, the rotation is
+    /// queued behind the timelock and only affects fees collected after it is
+    /// executed. Returns the id of the queued action.
+    pub fn propose_set_treasury(env: Env, admin: Address, treasury: Address) -> u64 {
         Self::require_admin(&env, admin.clone());
 
-        let previous = Self::get_treasury(env.clone());
+        Self::enqueue(env, admin, PendingAdminAction::Treasury(treasury))
+    }
+
+    /// Queue a change to the timelock delay itself (admin only).
+    ///
+    /// The delay can only be changed through the timelock, so a compromised or
+    /// impatient admin cannot shorten the notice window and then act on it in
+    /// the same ledger. Returns the id of the queued action.
+    pub fn propose_set_timelock_delay(env: Env, admin: Address, delay: u64) -> u64 {
+        Self::require_admin(&env, admin.clone());
+        Self::enqueue(env, admin, PendingAdminAction::TimelockDelay(delay))
+    }
+
+    /// Execute a queued action once its timelock has elapsed (admin only).
+    ///
+    /// Executing early is rejected; the action stays queued, so it can still be
+    /// executed after the delay. Executing removes it, so it cannot be replayed.
+    pub fn execute_pending_action(env: Env, admin: Address, action_id: u64) {
+        Self::require_admin(&env, admin.clone());
+
+        let mut pending = Self::get_pending_actions(env.clone());
+        let action = match pending.get(action_id) {
+            Some(action) => action,
+            None => panic!("no pending action with that id"),
+        };
+        require!(
+            env.ledger().timestamp() >= action.executable_at,
+            "action is still timelocked"
+        );
+
+        pending.remove(action_id);
         env.storage()
             .instance()
-            .set(&Symbol::new(&env, "treasury"), &treasury);
+            .set(&Symbol::new(&env, "pending_actions"), &pending);
+
+        Self::apply_action(&env, &action.action);
 
         env.events().publish(
-            (Symbol::new(&env, "treasury_updated"),),
-            (admin, previous, treasury),
+            (Symbol::new(&env, "action_executed"), action_id),
+            (admin, action.executable_at),
         );
+    }
+
+    /// Cancel a queued action (admin only), discarding it without effect.
+    pub fn cancel_pending_action(env: Env, admin: Address, action_id: u64) {
+        Self::require_admin(&env, admin.clone());
+
+        let mut pending = Self::get_pending_actions(env.clone());
+        require!(
+            pending.contains_key(action_id),
+            "no pending action with that id"
+        );
+        pending.remove(action_id);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "pending_actions"), &pending);
+
+        env.events()
+            .publish((Symbol::new(&env, "action_cancelled"), action_id), (admin,));
+    }
+
+    /// A queued action by id, if it is still pending.
+    pub fn get_pending_action(env: Env, action_id: u64) -> Option<PendingAction> {
+        Self::get_pending_actions(env).get(action_id)
+    }
+
+    /// The delay applied to economic-parameter changes, in seconds.
+    pub fn get_timelock_delay(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "timelock_delay"))
+            .unwrap_or(DEFAULT_TIMELOCK_DELAY)
     }
 
     /// Read the raw stored metrics without recomputing TVL
@@ -742,6 +855,121 @@ impl YieldVault {
         // This would integrate with Stellar AMM to calculate actual rewards
         // For now, return a simulated value
         1000i128
+    }
+
+    /// The queued timelocked actions, keyed by action id.
+    fn get_pending_actions(env: Env) -> Map<u64, PendingAction> {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "pending_actions"))
+            .unwrap_or(Map::new(&env))
+    }
+
+    /// Allocate the next action id.
+    fn next_action_id(env: &Env) -> u64 {
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(env, "next_action_id"))
+            .unwrap_or(1);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(env, "next_action_id"), &(id + 1));
+        id
+    }
+
+    /// Queue `action` so it becomes executable after the current timelock delay.
+    fn enqueue(env: Env, proposer: Address, action: PendingAdminAction) -> u64 {
+        let id = Self::next_action_id(&env);
+        let executable_at = env
+            .ledger()
+            .timestamp()
+            .saturating_add(Self::get_timelock_delay(env.clone()));
+
+        let mut pending = Self::get_pending_actions(env.clone());
+        pending.set(
+            id,
+            PendingAction {
+                id,
+                action,
+                proposer: proposer.clone(),
+                executable_at,
+            },
+        );
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "pending_actions"), &pending);
+
+        env.events().publish(
+            (Symbol::new(&env, "action_proposed"), id),
+            (proposer, executable_at),
+        );
+
+        id
+    }
+
+    /// Apply a matured action to storage. Only `execute_pending_action` calls
+    /// this, after checking the delay and removing the action from the queue.
+    fn apply_action(env: &Env, action: &PendingAdminAction) {
+        match action.clone() {
+            PendingAdminAction::Prices(price_a, price_b) => {
+                env.storage()
+                    .instance()
+                    .set(&Symbol::new(env, "price_a"), &price_a);
+                env.storage()
+                    .instance()
+                    .set(&Symbol::new(env, "price_b"), &price_b);
+
+                // Recompute TVL so the new prices are reflected immediately.
+                let metrics = Self::get_metrics(env.clone());
+                env.storage()
+                    .instance()
+                    .set(&Symbol::new(env, "metrics"), &metrics);
+
+                env.events()
+                    .publish((Symbol::new(env, "prices_updated"),), (price_a, price_b));
+            }
+            PendingAdminAction::MinDepositAmounts(min_a, min_b) => {
+                env.storage()
+                    .instance()
+                    .set(&Symbol::new(env, "min_deposit_a"), &min_a);
+                env.storage()
+                    .instance()
+                    .set(&Symbol::new(env, "min_deposit_b"), &min_b);
+
+                env.events()
+                    .publish((Symbol::new(env, "min_deposit_updated"),), (min_a, min_b));
+            }
+            PendingAdminAction::MinWithdrawShares(min_shares) => {
+                env.storage()
+                    .instance()
+                    .set(&Symbol::new(env, "min_withdraw_shares"), &min_shares);
+
+                env.events().publish(
+                    (Symbol::new(env, "min_withdraw_shares_updated"),),
+                    (min_shares,),
+                );
+            }
+            PendingAdminAction::Treasury(treasury) => {
+                let previous = Self::get_treasury(env.clone());
+                env.storage()
+                    .instance()
+                    .set(&Symbol::new(env, "treasury"), &treasury);
+
+                env.events().publish(
+                    (Symbol::new(env, "treasury_updated"),),
+                    (previous, treasury),
+                );
+            }
+            PendingAdminAction::TimelockDelay(delay) => {
+                env.storage()
+                    .instance()
+                    .set(&Symbol::new(env, "timelock_delay"), &delay);
+
+                env.events()
+                    .publish((Symbol::new(env, "timelock_delay_updated"),), (delay,));
+            }
+        }
     }
 
     /// Get admin address
@@ -1236,7 +1464,7 @@ mod tests {
         let new_treasury = Address::generate(&env);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            vault.set_treasury(&stranger, &new_treasury);
+            vault.propose_set_treasury(&stranger, &new_treasury);
         }));
 
         assert!(result.is_err(), "treasury rotation must be admin only");
@@ -1259,7 +1487,10 @@ mod tests {
         ) = setup(&env, 0, 0, 100);
         let new_treasury = Address::generate(&env);
 
-        vault.set_treasury(&admin, &new_treasury);
+        // Rotation is timelocked: propose, wait out the delay, then execute.
+        let action = vault.propose_set_treasury(&admin, &new_treasury);
+        env.ledger().set_timestamp(vault.get_timelock_delay() + 1);
+        vault.execute_pending_action(&admin, &action);
         assert_eq!(vault.get_treasury(), new_treasury);
 
         token_a_admin.mint(&user, &1000);
@@ -1271,6 +1502,168 @@ mod tests {
         assert_eq!(token_a_client.balance(&new_treasury), 10);
         assert_eq!(token_b_client.balance(&new_treasury), 10);
         assert_eq!(token_a_client.balance(&treasury), 0);
+    }
+
+    // ============ ADMIN TIMELOCK TESTS (Issue #301) ============
+
+    #[test]
+    fn test_default_timelock_delay_is_applied_at_initialize() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, ..) = setup(&env, 0, 0, 0);
+        assert_eq!(vault.get_timelock_delay(), DEFAULT_TIMELOCK_DELAY);
+    }
+
+    #[test]
+    fn test_economic_param_change_requires_the_timelock_to_elapse() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _, _, _, _, _, admin, _) = setup(&env, 0, 0, 0);
+
+        let action = vault.propose_set_prices(&admin, &11, &22);
+
+        // Queued, not applied.
+        assert_eq!(vault.get_prices(), (0, 0));
+        assert_eq!(vault.get_pending_action(&action).unwrap().id, action);
+
+        // Executing early is rejected and leaves the action queued.
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.execute_pending_action(&admin, &action);
+        }));
+        assert!(early.is_err(), "an unexpired change must be rejected");
+        assert_eq!(vault.get_prices(), (0, 0));
+        assert!(vault.get_pending_action(&action).is_some());
+
+        // Once the delay has elapsed it applies, and cannot be replayed.
+        env.ledger().set_timestamp(DEFAULT_TIMELOCK_DELAY + 1);
+        vault.execute_pending_action(&admin, &action);
+        assert_eq!(vault.get_prices(), (11, 22));
+        assert!(vault.get_pending_action(&action).is_none());
+
+        let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.execute_pending_action(&admin, &action);
+        }));
+        assert!(replay.is_err(), "an executed action must not be replayable");
+    }
+
+    #[test]
+    fn test_pending_action_can_be_cancelled() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _, _, _, _, _, admin, _) = setup(&env, 0, 0, 0);
+
+        let action = vault.propose_set_min_deposit_amounts(&admin, &5, &5);
+        assert!(vault.get_pending_action(&action).is_some());
+
+        vault.cancel_pending_action(&admin, &action);
+        assert!(vault.get_pending_action(&action).is_none());
+
+        env.ledger().set_timestamp(DEFAULT_TIMELOCK_DELAY + 1);
+        let executed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.execute_pending_action(&admin, &action);
+        }));
+        assert!(executed.is_err(), "a cancelled action must not apply");
+
+        // The previous minimum is untouched.
+        assert_eq!(
+            vault.get_min_deposit_amounts(),
+            (DEFAULT_MIN_DEPOSIT, DEFAULT_MIN_DEPOSIT)
+        );
+    }
+
+    #[test]
+    fn test_each_economic_action_takes_effect_after_the_delay() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _, _, _, _, _, admin, _) = setup(&env, 0, 0, 0);
+        let new_treasury = Address::generate(&env);
+
+        let deposits = vault.propose_set_min_deposit_amounts(&admin, &11, &22);
+        let withdrawals = vault.propose_set_min_withdraw_shares(&admin, &33);
+        let prices = vault.propose_set_prices(&admin, &44, &55);
+        let treasury = vault.propose_set_treasury(&admin, &new_treasury);
+
+        env.ledger().set_timestamp(DEFAULT_TIMELOCK_DELAY + 1);
+        vault.execute_pending_action(&admin, &deposits);
+        vault.execute_pending_action(&admin, &withdrawals);
+        vault.execute_pending_action(&admin, &prices);
+        vault.execute_pending_action(&admin, &treasury);
+
+        assert_eq!(vault.get_min_deposit_amounts(), (11, 22));
+        assert_eq!(vault.get_min_withdraw_shares(), 33);
+        assert_eq!(vault.get_prices(), (44, 55));
+        assert_eq!(vault.get_treasury(), new_treasury);
+    }
+
+    #[test]
+    fn test_timelock_delay_can_only_be_changed_through_the_timelock() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _, _, _, _, _, admin, _) = setup(&env, 0, 0, 0);
+
+        // Even setting the delay to zero has to wait out the current delay.
+        let change = vault.propose_set_timelock_delay(&admin, &0);
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.execute_pending_action(&admin, &change);
+        }));
+        assert!(early.is_err());
+        assert_eq!(vault.get_timelock_delay(), DEFAULT_TIMELOCK_DELAY);
+
+        env.ledger().set_timestamp(DEFAULT_TIMELOCK_DELAY + 1);
+        vault.execute_pending_action(&admin, &change);
+        assert_eq!(vault.get_timelock_delay(), 0);
+
+        // With a zero delay, propose and execute happen in the same ledger.
+        let action = vault.propose_set_prices(&admin, &7, &9);
+        vault.execute_pending_action(&admin, &action);
+        assert_eq!(vault.get_prices(), (7, 9));
+    }
+
+    #[test]
+    fn test_timelock_operations_are_admin_only() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _, _, _, _, _, admin, _) = setup(&env, 0, 0, 0);
+        let stranger = Address::generate(&env);
+
+        let proposed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.propose_set_prices(&stranger, &1, &1);
+        }));
+        assert!(proposed.is_err(), "only the admin may queue changes");
+
+        let action = vault.propose_set_prices(&admin, &1, &1);
+
+        let executed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.execute_pending_action(&stranger, &action);
+        }));
+        assert!(executed.is_err(), "only the admin may execute changes");
+
+        let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.cancel_pending_action(&stranger, &action);
+        }));
+        assert!(cancelled.is_err(), "only the admin may cancel changes");
+    }
+
+    #[test]
+    fn test_invalid_values_are_rejected_when_the_action_is_proposed() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _, _, _, _, _, admin, _) = setup(&env, 0, 0, 0);
+
+        let negative_price = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.propose_set_prices(&admin, &-1, &1);
+        }));
+        assert!(negative_price.is_err());
+
+        let negative_minimum = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.propose_set_min_deposit_amounts(&admin, &-1, &0);
+        }));
+        assert!(negative_minimum.is_err());
+
+        let zero_withdraw_minimum = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.propose_set_min_withdraw_shares(&admin, &0);
+        }));
+        assert!(zero_withdraw_minimum.is_err());
     }
 
     // ─── Per-user harvest tracking (Issue #116) ───────────────────────────────

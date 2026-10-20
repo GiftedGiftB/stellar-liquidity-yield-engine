@@ -1,10 +1,50 @@
 import {
+  ArbitrageOptimizer,
   ArbitrageScanner,
+  calculateConfidence,
   HorizonVolatilitySource,
   realizedVolatilityBp,
   VolatilityMetrics,
   VolatilitySource,
 } from './arbitrage';
+
+describe('calculateConfidence', () => {
+  it('returns 0 when sample size is 0', () => {
+    expect(calculateConfidence(0, 0)).toBe(0);
+  });
+
+  it('increases with sample size', () => {
+    const lowSample = calculateConfidence(5, 0);
+    const highSample = calculateConfidence(50, 0);
+    expect(highSample).toBeGreaterThan(lowSample);
+  });
+
+  it('caps at 50 points for sample size component', () => {
+    const atCap = calculateConfidence(50, 0);
+    const aboveCap = calculateConfidence(100, 0);
+    expect(atCap).toBeCloseTo(aboveCap);
+  });
+
+  it('decreases with data age', () => {
+    const fresh = calculateConfidence(25, 0);
+    const stale = calculateConfidence(25, 86400); // 24 hours old
+    expect(fresh).toBeGreaterThan(stale);
+  });
+
+  it('combines sample size and age components', () => {
+    const highConfidence = calculateConfidence(50, 0);
+    const lowConfidence = calculateConfidence(5, 86400 * 2);
+    expect(highConfidence).toBeGreaterThan(lowConfidence);
+    expect(highConfidence).toBeLessThanOrEqual(100);
+    expect(lowConfidence).toBeGreaterThanOrEqual(0);
+  });
+
+  it('respects half-life parameter', () => {
+    const shortHalfLife = calculateConfidence(25, 43200, 50, 43200); // 12h half-life, 12h old
+    const longHalfLife = calculateConfidence(25, 43200, 50, 86400); // 24h half-life, 12h old
+    expect(longHalfLife).toBeGreaterThan(shortHalfLife);
+  });
+});
 
 describe('realizedVolatilityBp', () => {
   it('returns null when there is not enough price history', () => {
@@ -119,7 +159,7 @@ describe('ArbitrageScanner volatility integration', () => {
 
   it('uses real volatility from the source and rounds to whole basis points', async () => {
     const scanner = buildScanner(
-      sourceReturning({ volatility_24h: 123.4, volatility_7d: 567.6 }),
+      sourceReturning({ volatility_24h: 123.4, volatility_7d: 567.6, sampleSize_24h: 25, sampleSize_7d: 100 }),
     );
 
     const metrics = await (scanner as any).parsePoolMetrics(poolRecord);
@@ -127,6 +167,7 @@ describe('ArbitrageScanner volatility integration', () => {
     expect(metrics).not.toBeNull();
     expect(metrics.volatility_24h).toBe(123);
     expect(metrics.volatility_7d).toBe(568);
+    expect(metrics.confidence).toBeGreaterThan(0);
   });
 
   it('skips pools when price history is unavailable instead of fabricating values', async () => {
@@ -138,7 +179,7 @@ describe('ArbitrageScanner volatility integration', () => {
   });
 
   it('filters opportunities using the fetched volatility', async () => {
-    const scanner = buildScanner(sourceReturning({ volatility_24h: 500, volatility_7d: 600 }));
+    const scanner = buildScanner(sourceReturning({ volatility_24h: 500, volatility_7d: 600, sampleSize_24h: 30, sampleSize_7d: 100 }));
     jest
       .spyOn(scanner, 'scanAllPools')
       .mockResolvedValue([
@@ -150,6 +191,7 @@ describe('ArbitrageScanner volatility integration', () => {
           reserve_b: BigInt(2000),
           volatility_24h: 500,
           volatility_7d: 600,
+          confidence: 75,
         },
         {
           pool_id: 'high-vol-pool',
@@ -159,6 +201,7 @@ describe('ArbitrageScanner volatility integration', () => {
           reserve_b: BigInt(2000),
           volatility_24h: 20000,
           volatility_7d: 30000,
+          confidence: 75,
         },
       ]);
 
@@ -169,5 +212,98 @@ describe('ArbitrageScanner volatility integration', () => {
     ]);
     expect(opportunities[0].il_risk).toBe(500);
     expect(typeof opportunities[0].net_profit).toBe('bigint');
+    expect(opportunities[0].confidence).toBe(75);
+  });
+});
+
+describe('ArbitrageOptimizer confidence-weighted ranking', () => {
+  it('ranks opportunities higher when confidence is higher', () => {
+    const opportunities = [
+      {
+        pool_id: 'pool-a',
+        current_apy: 1000,
+        projected_apy: 1500,
+        il_risk: 100,
+        net_profit: BigInt(400000),
+        apy_delta: 500,
+        recommended: true,
+        confidence: 50, // Lower confidence
+      },
+      {
+        pool_id: 'pool-b',
+        current_apy: 1000,
+        projected_apy: 1500,
+        il_risk: 100,
+        net_profit: BigInt(400000),
+        apy_delta: 500,
+        recommended: true,
+        confidence: 90, // Higher confidence
+      },
+    ];
+
+    const ranked = ArbitrageOptimizer.rankOpportunities(opportunities, 5);
+
+    expect(ranked[0].pool_id).toBe('pool-b'); // Higher confidence should rank first
+    expect(ranked[1].pool_id).toBe('pool-a');
+  });
+
+  it('still considers APY delta when confidence is equal', () => {
+    const opportunities = [
+      {
+        pool_id: 'pool-a',
+        current_apy: 1000,
+        projected_apy: 1400,
+        il_risk: 100,
+        net_profit: BigInt(300000),
+        apy_delta: 400,
+        recommended: true,
+        confidence: 75,
+      },
+      {
+        pool_id: 'pool-b',
+        current_apy: 1000,
+        projected_apy: 1600,
+        il_risk: 100,
+        net_profit: BigInt(500000),
+        apy_delta: 600,
+        recommended: true,
+        confidence: 75,
+      },
+    ];
+
+    const ranked = ArbitrageOptimizer.rankOpportunities(opportunities, 5);
+
+    expect(ranked[0].pool_id).toBe('pool-b'); // Higher APY delta should rank first
+    expect(ranked[1].pool_id).toBe('pool-a');
+  });
+
+  it('balances confidence and risk when ranking', () => {
+    const opportunities = [
+      {
+        pool_id: 'pool-a',
+        current_apy: 1000,
+        projected_apy: 1500,
+        il_risk: 50, // Lower risk
+        net_profit: BigInt(450000),
+        apy_delta: 500,
+        recommended: true,
+        confidence: 60,
+      },
+      {
+        pool_id: 'pool-b',
+        current_apy: 1000,
+        projected_apy: 1500,
+        il_risk: 200, // Higher risk
+        net_profit: BigInt(300000),
+        apy_delta: 500,
+        recommended: true,
+        confidence: 95,
+      },
+    ];
+
+    const ranked = ArbitrageOptimizer.rankOpportunities(opportunities, 5);
+
+    // With moderate risk tolerance (5), lower risk should win despite lower confidence
+    expect(ranked[0].pool_id).toBe('pool-a');
   });
 });

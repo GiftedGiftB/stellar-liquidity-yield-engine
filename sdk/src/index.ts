@@ -8,6 +8,7 @@ export { VaultClient } from './vaultClient';
 export { RebalancerClient } from './rebalancer';
 export { YieldCalculator } from './yieldCalculator';
 export * from './insurance';
+export * from './utils';
 
 // Re-export commonly used types and classes for convenience
 export {
@@ -26,6 +27,10 @@ export type { VolatilitySource, VolatilityMetrics, PoolMetrics, Opportunity } fr
 // with a contract call to `get_active_strategies`.
 export { StrategyRegistryClient } from './strategyRegistryClient';
 
+// Keeper write pacing: rate-limit transaction submissions to avoid throttling.
+export { WriteRateLimiter } from './utils/rateLimiter';
+export type { WriteRateLimiterOptions, WriteRateLimiterStats } from './utils/rateLimiter';
+
 // RPC synchronization: ledger-head lag detection for keepers.
 export {
   RpcLagMonitor,
@@ -38,6 +43,29 @@ export {
   LEDGER_CLOSE_TIME_SECONDS,
 } from './rpcSync';
 export type { RpcLagReport, RpcLagOptions, RpcLagThresholds, LagSeverity, LedgerHeadSource } from './rpcSync';
+
+// Address-filtered contract event listener for off-chain keepers.
+// Operators running multiple contracts can restrict a single listener to only
+// the contract addresses they care about, eliminating noise from unrelated
+// on-chain activity.
+export { ContractEventListener } from './eventListener';
+export type {
+  ListenerConfig,
+  EventSource,
+  GetEventsFilter,
+  GetEventsRequest,
+  GetEventsResponse,
+  RawContractEvent,
+  FilteredVaultEvent,
+  FilteredRebalanceEvent,
+  FilteredRewardEvent,
+  UnknownContractEvent,
+  KnownEventName,
+  EventHandlerMap,
+  EventHandler,
+  RawEventHandler,
+  ListenerErrorEvent,
+} from './eventListener';
 // TEMP-VERIFY-DISABLED (pre-existing syntax error unrelated to this change, restored after check): export { AutoRebalancer, runScheduledRebalancer } from './bots/autoRebalancer';
 
 // Governance SDK exports

@@ -120,7 +120,11 @@ pub struct ArbitrageThresholds {
     pub cooldown_period: u64, // Seconds between rebalances, applied per vault
 }
 
-/// One oracle observation for a pool (Issue #105)
+/// One oracle observation for a pool.
+///
+/// `updated_by` is the authenticated admin or APY keeper that most recently
+/// published this feed, and `updated_at` is the ledger timestamp (seconds) of
+/// that successful publication.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolApyRecord {
@@ -505,6 +509,11 @@ impl RebalanceEngine {
         Self::require_not_paused(&env);
         Self::require_admin_or_apy_keeper(&env, caller.clone());
         require!(env, apy_bps <= MAX_APY_BPS, RebalanceError::ApyOutOfRange);
+        require!(apy_bps <= MAX_APY_BPS, "apy_bps exceeds maximum");
+        // The caller address is part of the feed's public provenance, so it
+        // must be authorized by that address rather than merely supplied as a
+        // method argument.
+        caller.require_auth();
 
         let record = PoolApyRecord {
             apy_bps,
@@ -1198,6 +1207,7 @@ mod tests {
     // ============ APY ORACLE REGISTRY TESTS (Issue #105) ============
 
     fn engine(env: &Env) -> (RebalanceEngineClient<'static>, Address) {
+        env.mock_all_auths_allowing_non_root_auth();
         let admin = Address::generate(env);
         let contract_id = env.register(RebalanceEngine, ());
         let client = RebalanceEngineClient::new(env, &contract_id);
@@ -1252,30 +1262,45 @@ mod tests {
     }
 
     #[test]
-    fn test_pool_apy_update_overwrites_previous_value() {
+    fn test_pool_apy_update_overwrites_provenance_with_latest_successful_update() {
         let env = Env::default();
         let (client, admin) = engine(&env);
+        let keeper = Address::generate(&env);
         let pool = Address::generate(&env);
 
+        env.ledger().set_timestamp(100);
         client.update_pool_apy(&admin, &pool, &1500);
-        client.update_pool_apy(&admin, &pool, &800);
+        let first = client.get_pool_apy_record(&pool).unwrap();
+
+        client.set_apy_keepers(&admin, &Vec::from_array(&env, [keeper.clone()]));
+        env.ledger().set_timestamp(200);
+        client.update_pool_apy(&keeper, &pool, &800);
 
         assert_eq!(client.get_pool_current_apy(&pool), 800);
+        let latest = client.get_pool_apy_record(&pool).unwrap();
+        assert_eq!(latest.updated_by, keeper);
+        assert_eq!(latest.updated_at, 200);
+        assert_ne!(latest.updated_by, first.updated_by);
+        assert_ne!(latest.updated_at, first.updated_at);
     }
 
     #[test]
     fn test_pool_apy_rejects_unauthorized_caller() {
         let env = Env::default();
-        let (client, _admin) = engine(&env);
+        let (client, admin) = engine(&env);
         let pool = Address::generate(&env);
         let stranger = Address::generate(&env);
 
+        env.ledger().set_timestamp(100);
+        client.update_pool_apy(&admin, &pool, &900);
+        let before = client.get_pool_apy_record(&pool).unwrap();
+
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.update_pool_apy(&stranger, &pool, &900);
+            client.update_pool_apy(&stranger, &pool, &1000);
         }));
 
         assert!(result.is_err(), "unauthorized apy update must panic");
-        assert_eq!(client.get_pool_current_apy(&pool), 0);
+        assert_eq!(client.get_pool_apy_record(&pool).unwrap(), before);
     }
 
     #[test]
@@ -1315,11 +1340,40 @@ mod tests {
         let (client, admin) = engine(&env);
         let pool = Address::generate(&env);
 
+        env.ledger().set_timestamp(100);
+        client.update_pool_apy(&admin, &pool, &1234);
+        let before = client.get_pool_apy_record(&pool).unwrap();
+
+        env.ledger().set_timestamp(200);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.update_pool_apy(&admin, &pool, &(MAX_APY_BPS + 1));
         }));
 
         assert!(result.is_err(), "apy above MAX_APY_BPS must panic");
+        assert_eq!(client.get_pool_apy_record(&pool).unwrap(), before);
+    }
+
+    #[test]
+    fn test_pool_apy_metadata_is_isolated_per_pool() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let keeper = Address::generate(&env);
+        let pool_a = Address::generate(&env);
+        let pool_b = Address::generate(&env);
+
+        client.set_apy_keepers(&admin, &Vec::from_array(&env, [keeper.clone()]));
+        env.ledger().set_timestamp(100);
+        client.update_pool_apy(&admin, &pool_a, &1200);
+        client.update_pool_apy(&keeper, &pool_b, &2400);
+        let pool_b_before = client.get_pool_apy_record(&pool_b).unwrap();
+
+        env.ledger().set_timestamp(200);
+        client.update_pool_apy(&admin, &pool_a, &1300);
+
+        let pool_a_record = client.get_pool_apy_record(&pool_a).unwrap();
+        assert_eq!(pool_a_record.updated_by, admin);
+        assert_eq!(pool_a_record.updated_at, 200);
+        assert_eq!(client.get_pool_apy_record(&pool_b).unwrap(), pool_b_before);
     }
 
     #[test]
