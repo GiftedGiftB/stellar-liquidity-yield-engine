@@ -188,7 +188,33 @@ impl YieldVault {
         crate::upgrade::mark_migrated(&env, &admin)
     }
 
-    /// Deposit tokens into the vault
+    /// Deposit tokens into the vault in exchange for vault shares.
+    ///
+    /// # Share Calculation & Rounding Semantics
+    /// - **First Deposit (`total_shares == 0`)**:
+    ///   Mints shares 1:1 with the combined deposited token value (`amount_a + amount_b`).
+    /// - **Subsequent Deposits (`total_shares > 0`)**:
+    ///   Mints shares proportionally to the combined pool assets:
+    ///   `shares = (amount_a + amount_b) * total_shares / total_value`
+    ///   where `total_value = total_amount_a + total_amount_b`.
+    /// - **Rounding Semantics**:
+    ///   Integer arithmetic performs floor truncation (rounds down towards zero).
+    ///   When a deposit's combined on-chain value is too small relative to `total_value`,
+    ///   integer division truncates to zero shares (`shares == 0`). Rather than silently
+    ///   crediting zero shares and absorbing the user's tokens as an uncredited donation,
+    ///   an explicit pre-transfer guard rejects the transaction before any tokens move
+    ///   with the panic message: `"deposit too small: mints zero shares"`.
+    /// - **Slippage Protection**:
+    ///   The depositor can specify `min_shares`. If `shares < min_shares`, the transaction
+    ///   aborts with panic `"insufficient shares received"`.
+    ///
+    /// # Panics
+    /// - If the vault is paused (`"contract is paused"`).
+    /// - If `amount_a` is below the configured minimum deposit (`"amount_a below minimum deposit"`).
+    /// - If `amount_b` is below the configured minimum deposit (`"amount_b below minimum deposit"`).
+    /// - If the combined deposit amount is not positive (`"deposit must be positive"`).
+    /// - If the deposit would mint zero shares (`"deposit too small: mints zero shares"`).
+    /// - If the minted shares are less than `min_shares` (`"insufficient shares received"`).
     pub fn deposit(
         env: Env,
         user: Address,
@@ -208,14 +234,7 @@ impl YieldVault {
         let vault_info = Self::get_vault_info(env.clone());
         let mut metrics = Self::get_metrics(env.clone());
 
-        // Transfer tokens from user to vault
-        let token_a_client = TokenClient::new(&env, &vault_info.token_a);
-        let token_b_client = TokenClient::new(&env, &vault_info.token_b);
-
-        token_a_client.transfer(&user, &env.current_contract_address(), &amount_a);
-        token_b_client.transfer(&user, &env.current_contract_address(), &amount_b);
-
-        // Calculate shares based on the combined value of both tokens
+        // Calculate shares based on the combined value of both tokens before transferring tokens.
         let shares = if metrics.total_shares == 0 {
             // First deposit - 1:1 shares per unit of combined deposit value
             amount_a + amount_b
@@ -229,13 +248,20 @@ impl YieldVault {
             }
         };
 
-        // A deposit that rounds down to nothing would be a pure donation, so it
-        // is rejected instead of silently credited to existing holders.
+        // Explicit pre-transfer guard: a deposit that rounds down to nothing due to integer
+        // truncation would be a pure donation, so it is rejected before any tokens move.
         require!(shares > 0, "deposit too small: mints zero shares");
 
         if shares < min_shares {
             panic!("insufficient shares received");
         }
+
+        // Transfer tokens from user to vault
+        let token_a_client = TokenClient::new(&env, &vault_info.token_a);
+        let token_b_client = TokenClient::new(&env, &vault_info.token_b);
+
+        token_a_client.transfer(&user, &env.current_contract_address(), &amount_a);
+        token_b_client.transfer(&user, &env.current_contract_address(), &amount_b);
 
         // Update user position
         let mut position = Self::get_user_position(env.clone(), user.clone());
@@ -1251,6 +1277,67 @@ mod tests {
 
         assert_eq!(first_shares, 2000);
         assert_eq!(second_shares, 1000);
+    }
+
+    /// A deposit that rounds down to zero shares due to integer truncation
+    /// is rejected with a clear panic rather than silently crediting nothing.
+    #[test]
+    fn test_deposit_that_would_mint_zero_shares_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, token_a_client, _, token_a_admin, token_b_admin, user, admin, _) =
+            setup(&env, 0, 0, 0);
+        let dust_user = Address::generate(&env);
+
+        // A large first position makes every later share expensive.
+        token_a_admin.mint(&user, &1_000_000);
+        token_b_admin.mint(&user, &1_000_000);
+        vault.deposit(&user, &1_000_000, &1_000_000, &0);
+
+        // Harvesting raises the value per share above 1, so a 1 unit deposit
+        // now mints 2_000_000 * 1 / 2_002_000 == 0 shares due to integer truncation.
+        vault.harvest(&admin);
+
+        token_a_admin.mint(&dust_user, &1);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.deposit(&dust_user, &1, &0, &0);
+        }));
+
+        assert!(result.is_err(), "a zero-share deposit must be rejected");
+        assert_eq!(vault.get_user_position(&dust_user).shares, 0);
+        // The dust deposit was rejected before transfer, so the balance is untouched.
+        assert_eq!(token_a_client.balance(&dust_user), 1);
+    }
+
+    /// A marginal-but-valid deposit whose share calculation truncates to at least 1 share
+    /// still succeeds and mints the expected non-zero shares.
+    #[test]
+    fn test_marginal_valid_deposit_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, token_a_client, _, token_a_admin, token_b_admin, user, admin, _) =
+            setup(&env, 0, 0, 0);
+        let marginal_user = Address::generate(&env);
+
+        // Establish the same pool state:
+        // total_shares = 2_000_000, total_amount_a = 1_000_000, total_amount_b = 1_000_000
+        token_a_admin.mint(&user, &1_000_000);
+        token_b_admin.mint(&user, &1_000_000);
+        vault.deposit(&user, &1_000_000, &1_000_000, &0);
+
+        // Harvesting raises total_value to 2_002_000 while total_shares remains 2_000_000.
+        vault.harvest(&admin);
+
+        // A marginal deposit of 2 units:
+        // (2 + 0) * 2_000_000 / 2_002_000 = 4_000_000 / 2_002_000 = 1 share.
+        // 1 unit was rejected, but 2 units marginally succeeds with 1 share.
+        token_a_admin.mint(&marginal_user, &2);
+
+        let shares = vault.deposit(&marginal_user, &2, &0, &0);
+        assert_eq!(shares, 1, "marginal deposit of 2 units must mint 1 share");
+        assert_eq!(vault.get_user_position(&marginal_user).shares, 1);
+        assert_eq!(token_a_client.balance(&marginal_user), 0);
     }
 
     #[test]

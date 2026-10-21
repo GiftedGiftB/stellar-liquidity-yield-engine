@@ -1172,23 +1172,29 @@ mod tests {
         env.mock_all_auths_allowing_non_root_auth();
         let (admin, _creator, client) = setup(&env);
 
+        use soroban_sdk::FromVal;
         client.pause(&admin);
-        client.unpause(&admin);
-
-        let events = env.events().all();
+        let events_pause = env.events().all();
         let mut saw_pause = false;
-        let mut saw_unpause = false;
-        for (topics, _data) in events.iter() {
+        for (_contract, topics, _data) in events_pause.iter() {
             let first = topics.get(0).unwrap();
-            let sym: Symbol = first.try_into().unwrap();
+            let sym: Symbol = Symbol::from_val(&env, &first);
             if sym == Symbol::new(&env, "registry_paused") {
                 saw_pause = true;
             }
+        }
+        assert!(saw_pause, "pause must emit registry_paused event");
+
+        client.unpause(&admin);
+        let events_unpause = env.events().all();
+        let mut saw_unpause = false;
+        for (_contract, topics, _data) in events_unpause.iter() {
+            let first = topics.get(0).unwrap();
+            let sym: Symbol = Symbol::from_val(&env, &first);
             if sym == Symbol::new(&env, "registry_unpaused") {
                 saw_unpause = true;
             }
         }
-        assert!(saw_pause, "pause must emit registry_paused event");
         assert!(saw_unpause, "unpause must emit registry_unpaused event");
     }
 
