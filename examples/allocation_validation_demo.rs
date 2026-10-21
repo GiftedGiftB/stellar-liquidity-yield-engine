@@ -238,19 +238,19 @@ fn example_valid_asymmetric(env: &Env) -> Vec<PoolAllocation> {
     // Result: ACCEPTED ✓ (7500 + 1500 + 1000 = 10000)
 }
 
-/// Summary of Validation Rules:
-/// 
-/// ✓ VALID allocations must meet ALL of these conditions:
-/// 1. The allocations vector must NOT be empty (at least 1 pool)
-/// 2. Each individual allocation_percent must be <= 10000
-/// 3. The SUM of all allocation_percent values must EQUAL exactly 10000
-/// 
-/// ✗ INVALID allocations will be REJECTED if ANY of these are true:
-/// 1. The allocations vector is empty
-/// 2. Any individual allocation_percent exceeds 10000
-/// 3. The sum of allocation_percent is less than 10000
-/// 4. The sum of allocation_percent is greater than 10000
-/// 
-/// Note: 10000 basis points = 100.00%
-///       1 basis point = 0.01%
-///       Example: 5000 bps = 50.00%
+// Summary of Validation Rules:
+// 
+// ✓ VALID allocations must meet ALL of these conditions:
+// 1. The allocations vector must NOT be empty (at least 1 pool)
+// 2. Each individual allocation_percent must be <= 10000
+// 3. The SUM of all allocation_percent values must EQUAL exactly 10000
+// 
+// ✗ INVALID allocations will be REJECTED if ANY of these are true:
+// 1. The allocations vector is empty
+// 2. Any individual allocation_percent exceeds 10000
+// 3. The sum of allocation_percent is less than 10000
+// 4. The sum of allocation_percent is greater than 10000
+// 
+// Note: 10000 basis points = 100.00%
+//       1 basis point = 0.01%
+//       Example: 5000 bps = 50.00%
