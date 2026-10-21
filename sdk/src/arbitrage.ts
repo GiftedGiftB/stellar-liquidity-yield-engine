@@ -7,10 +7,46 @@ export interface Opportunity {
   current_apy: number; // Basis points
   projected_apy: number; // Basis points
   il_risk: number; // Basis points
+  /** Expected one-year APY-difference return in investment-asset base units. */
+  gross_profit?: bigint;
+  /** Estimated cost of entering and then exiting, in the same asset units. */
+  round_trip_cost?: bigint | null;
+  investment_amount?: bigint;
+  /** Expected one-year return after round-trip fees, before IL risk adjustment. */
   net_profit: bigint;
   apy_delta: number;
   recommended: boolean;
   confidence: number; // 0-100, confidence score based on data age and sample size
+}
+
+export interface RoundTripCostEstimate {
+  /** All amounts are denominated in the requested investment asset's base units. */
+  asset: string;
+  networkCost: bigint;
+  executionCost: bigint;
+  protocolCost: bigint;
+}
+
+export interface RoundTripCostEstimator {
+  /**
+   * Estimate fees for both entering the destination pool and exiting it.
+   * Implementations must convert all components into `asset` units using a
+   * trustworthy quote source, or return null when they cannot do so.
+   */
+  estimateRoundTripCosts(input: {
+    amount: bigint;
+    asset: string;
+    sourcePoolId: string;
+    destinationPoolId: string;
+  }): Promise<RoundTripCostEstimate | null>;
+}
+
+export interface OpportunityScanOptions {
+  /** Position size used to compare one year of APY gain with absolute fees. */
+  investmentAmount: bigint;
+  /** Asset represented by investmentAmount and all estimator cost outputs. */
+  investmentAsset: string;
+  sourcePoolId: string;
 }
 
 export interface PoolMetrics {
@@ -172,16 +208,21 @@ export class HorizonVolatilitySource implements VolatilitySource {
 export class ArbitrageScanner {
   private horizonServer: Horizon.Server;
   private volatilitySource: VolatilitySource;
+  private roundTripCostEstimator?: RoundTripCostEstimator;
   private poolCache: Map<string, PoolMetrics> = new Map();
   private lastScanTime: number = 0;
   private cacheExpiry: number = 60000; // 60 seconds
 
   constructor(
     horizonUrl: string = 'https://horizon.stellar.org',
-    options: { volatilitySource?: VolatilitySource } = {},
+    options: {
+      volatilitySource?: VolatilitySource;
+      roundTripCostEstimator?: RoundTripCostEstimator;
+    } = {},
   ) {
     this.horizonServer = new Horizon.Server(horizonUrl);
     this.volatilitySource = options.volatilitySource ?? new HorizonVolatilitySource(horizonUrl);
+    this.roundTripCostEstimator = options.roundTripCostEstimator;
   }
 
   /**
@@ -281,33 +322,109 @@ export class ArbitrageScanner {
     currentVaultApy: number,
     minApyDelta: number = 200, // 2%
     maxIlTolerance: number = 100, // 1%
+    scanOptions?: OpportunityScanOptions,
   ): Promise<Opportunity[]> {
     const allPools = await this.scanAllPools();
     const opportunities: Opportunity[] = [];
 
+    if (
+      !this.roundTripCostEstimator ||
+      !scanOptions ||
+      !Number.isSafeInteger(minApyDelta) ||
+      minApyDelta < 0 ||
+      !Number.isSafeInteger(maxIlTolerance) ||
+      maxIlTolerance < 0 ||
+      typeof scanOptions.investmentAmount !== 'bigint' ||
+      scanOptions.investmentAmount <= BigInt(0) ||
+      !scanOptions.investmentAsset ||
+      !scanOptions.sourcePoolId
+    ) {
+      console.warn(
+        'Skipping arbitrage opportunities because a valid investment and round-trip cost estimator are required',
+      );
+      return opportunities;
+    }
+
     for (const pool of allPools) {
+      if (
+        !Number.isSafeInteger(currentVaultApy) ||
+        !Number.isSafeInteger(pool.current_apy) ||
+        !Number.isSafeInteger(pool.volatility_24h) ||
+        pool.volatility_24h < 0
+      ) {
+        console.warn(`Skipping pool ${pool.pool_id}: invalid APY or risk metrics`);
+        continue;
+      }
+
       const apy_delta = Math.max(0, pool.current_apy - currentVaultApy);
+      if (!Number.isSafeInteger(apy_delta)) {
+        console.warn(`Skipping pool ${pool.pool_id}: APY difference exceeds safe precision`);
+        continue;
+      }
 
       // Filter by thresholds
       if (apy_delta >= minApyDelta && pool.volatility_24h <= maxIlTolerance * 100) {
-        const net_profit = BigInt(apy_delta - pool.volatility_24h) * BigInt(1000000) / BigInt(10000);
+        let estimate: RoundTripCostEstimate | null;
+        try {
+          estimate = await this.roundTripCostEstimator.estimateRoundTripCosts({
+            amount: scanOptions.investmentAmount,
+            asset: scanOptions.investmentAsset,
+            sourcePoolId: scanOptions.sourcePoolId,
+            destinationPoolId: pool.pool_id,
+          });
+        } catch (error) {
+          console.error(`Failed to estimate round-trip costs for pool ${pool.pool_id}:`, error);
+          continue;
+        }
+
+        if (
+          !estimate ||
+          estimate.asset !== scanOptions.investmentAsset ||
+          typeof estimate.networkCost !== 'bigint' ||
+          typeof estimate.executionCost !== 'bigint' ||
+          typeof estimate.protocolCost !== 'bigint' ||
+          estimate.networkCost < BigInt(0) ||
+          estimate.executionCost < BigInt(0) ||
+          estimate.protocolCost < BigInt(0)
+        ) {
+          console.warn(
+            `Skipping pool ${pool.pool_id}: round-trip cost estimate is unavailable, invalid, or in incompatible units`,
+          );
+          continue;
+        }
+
+        const round_trip_cost =
+          estimate.networkCost + estimate.executionCost + estimate.protocolCost;
+        const gross_profit =
+          (scanOptions.investmentAmount * BigInt(apy_delta)) / BigInt(10000);
+        const net_profit = gross_profit - round_trip_cost;
+
+        // APY is annualized, so compare the round-trip fees with one year of
+        // expected gain on the same configured investment amount.
+        if (net_profit <= BigInt(0)) {
+          continue;
+        }
+        const netApyDelta =
+          (net_profit * BigInt(10000)) / scanOptions.investmentAmount;
 
         opportunities.push({
           pool_id: pool.pool_id,
           current_apy: currentVaultApy,
           projected_apy: pool.current_apy,
           il_risk: pool.volatility_24h,
+          gross_profit,
+          round_trip_cost,
+          investment_amount: scanOptions.investmentAmount,
           net_profit,
           apy_delta,
-          recommended: apy_delta >= minApyDelta * 2, // Strong signal if 2x threshold
-          confidence: pool.confidence,
+          recommended: netApyDelta >= minApyDelta * 2,
         });
       }
     }
 
     // Sort by net profit descending
-    return opportunities.sort((a, b) => 
-      Number((b.net_profit - a.net_profit)) 
+    return opportunities.sort((a, b) =>
+      a.net_profit === b.net_profit ? 0 : a.net_profit > b.net_profit ? -1 : 1,
     );
   }
 }
@@ -342,26 +459,43 @@ export class ArbitrageExecutor {
   async simulateRebalance(
     opportunity: Opportunity,
     currentPosition: bigint,
-    gasEstimate: bigint = BigInt(50000),
   ): Promise<{
     totalCost: bigint;
     netProfit: bigint;
     profitable: boolean;
+    costEstimateAvailable: boolean;
   }> {
-    // Calculate all costs
-    const ilCost = (currentPosition * BigInt(opportunity.il_risk)) / BigInt(10000);
-    const slippageCost = (currentPosition * BigInt(10)) / BigInt(10000); // 10 bp slippage
-    const entryFee = (currentPosition * BigInt(25)) / BigInt(10000); // 25 bp entry fee
-    const totalCost = gasEstimate + ilCost + slippageCost + entryFee;
+    if (
+      typeof opportunity.round_trip_cost !== 'bigint' ||
+      opportunity.round_trip_cost === undefined ||
+      opportunity.round_trip_cost < BigInt(0) ||
+      opportunity.investment_amount !== currentPosition ||
+      typeof opportunity.gross_profit !== 'bigint' ||
+      opportunity.gross_profit === undefined ||
+      opportunity.gross_profit < BigInt(0) ||
+      !Number.isSafeInteger(opportunity.il_risk) ||
+      opportunity.il_risk < 0 ||
+      currentPosition <= BigInt(0)
+    ) {
+      return {
+        totalCost: BigInt(0),
+        netProfit: BigInt(0),
+        profitable: false,
+        costEstimateAvailable: false,
+      };
+    }
 
-    // Calculate profit
-    const apyGain = (currentPosition * BigInt(opportunity.apy_delta)) / BigInt(10000);
-    const netProfit = apyGain - totalCost;
+    // Round-trip fees were estimated during scanning; do not add a second
+    // network or execution estimate here. Keep the existing IL risk deduction.
+    const ilCost = (currentPosition * BigInt(opportunity.il_risk)) / BigInt(10000);
+    const totalCost = opportunity.round_trip_cost + ilCost;
+    const netProfit = opportunity.gross_profit - totalCost;
 
     return {
       totalCost,
       netProfit,
       profitable: netProfit > BigInt(0),
+      costEstimateAvailable: true,
     };
   }
 
@@ -384,6 +518,31 @@ export class ArbitrageExecutor {
         return {
           success: false,
           error: 'Opportunity no longer meets recommended threshold',
+        };
+      }
+      if (
+        typeof opportunity.round_trip_cost !== 'bigint' ||
+        opportunity.round_trip_cost === undefined ||
+        opportunity.round_trip_cost < BigInt(0) ||
+        opportunity.investment_amount !== amount ||
+        amount <= BigInt(0) ||
+        typeof opportunity.gross_profit !== 'bigint' ||
+        opportunity.gross_profit < BigInt(0) ||
+        !Number.isSafeInteger(opportunity.il_risk) ||
+        opportunity.il_risk < 0 ||
+        typeof opportunity.net_profit !== 'bigint' ||
+        opportunity.net_profit <= BigInt(0)
+      ) {
+        return {
+          success: false,
+          error: 'Opportunity has no valid profitable round-trip cost estimate for this amount',
+        };
+      }
+      const ilCost = (amount * BigInt(opportunity.il_risk)) / BigInt(10000);
+      if (opportunity.gross_profit - opportunity.round_trip_cost - ilCost <= BigInt(0)) {
+        return {
+          success: false,
+          error: 'Opportunity is not profitable after round-trip costs and IL risk',
         };
       }
 
@@ -424,24 +583,44 @@ export class ArbitrageOptimizer {
   static calculateProfitability(
     opportunity: Opportunity,
     amount: bigint,
-    gasPrice: bigint = BigInt(100),
   ): {
     grossProfit: bigint;
     netProfit: bigint;
     roi: number; // Percentage
+    costEstimateAvailable: boolean;
   } {
-    const gasCost = gasPrice * BigInt(50000); // 50k ops
-    const ilCost = (amount * BigInt(opportunity.il_risk)) / BigInt(10000);
-    const totalCost = gasCost + ilCost;
-
     const grossProfit = (amount * BigInt(opportunity.apy_delta)) / BigInt(10000);
-    const netProfit = grossProfit - totalCost;
-    const roi = Number((netProfit * BigInt(10000)) / amount) / 100;
+    const hasEstimate =
+      typeof opportunity.round_trip_cost === 'bigint' &&
+      opportunity.round_trip_cost !== undefined &&
+      opportunity.round_trip_cost >= BigInt(0) &&
+      opportunity.investment_amount === amount &&
+      amount > BigInt(0) &&
+      typeof opportunity.gross_profit === 'bigint' &&
+      opportunity.gross_profit >= BigInt(0) &&
+      Number.isSafeInteger(opportunity.il_risk) &&
+      opportunity.il_risk >= 0;
+
+    if (!hasEstimate) {
+      return {
+        grossProfit,
+        netProfit: BigInt(0),
+        roi: 0,
+        costEstimateAvailable: false,
+      };
+    }
+
+    const ilCost = (amount * BigInt(opportunity.il_risk)) / BigInt(10000);
+    const netProfit = grossProfit - opportunity.round_trip_cost! - ilCost;
+    const roi = amount > BigInt(0)
+      ? Number((netProfit * BigInt(10000)) / amount) / 100
+      : 0;
 
     return {
       grossProfit,
       netProfit,
       roi,
+      costEstimateAvailable: true,
     };
   }
 
@@ -453,20 +632,25 @@ export class ArbitrageOptimizer {
     riskTolerance: number, // 1-10, higher = more risk acceptable
   ): Opportunity[] {
     return opportunities.sort((a, b) => {
-      // Risk-adjusted score = APY delta - (IL risk * risk factor)
+      // Net APY (after round-trip costs) adjusted by the existing IL risk factor.
       const riskFactor = 0.1 * (11 - riskTolerance);
-      const baseScoreA = a.apy_delta - a.il_risk * riskFactor;
-      const baseScoreB = b.apy_delta - b.il_risk * riskFactor;
-
-      // Apply confidence weighting: higher confidence = higher effective score
-      // Confidence is 0-100, so we normalize to 0-1 and use as a multiplier
-      const confidenceWeightA = a.confidence / 100;
-      const confidenceWeightB = b.confidence / 100;
-
-      const weightedScoreA = baseScoreA * confidenceWeightA;
-      const weightedScoreB = baseScoreB * confidenceWeightB;
-
-      return weightedScoreB - weightedScoreA;
+      const netApyDeltaA =
+        a.round_trip_cost !== undefined &&
+        a.round_trip_cost !== null &&
+        a.investment_amount !== undefined &&
+        a.investment_amount > BigInt(0)
+          ? Number((a.net_profit * BigInt(10000)) / a.investment_amount)
+          : Number.NEGATIVE_INFINITY;
+      const netApyDeltaB =
+        b.round_trip_cost !== undefined &&
+        b.round_trip_cost !== null &&
+        b.investment_amount !== undefined &&
+        b.investment_amount > BigInt(0)
+          ? Number((b.net_profit * BigInt(10000)) / b.investment_amount)
+          : Number.NEGATIVE_INFINITY;
+      const scoreA = netApyDeltaA - a.il_risk * riskFactor;
+      const scoreB = netApyDeltaB - b.il_risk * riskFactor;
+      return scoreB - scoreA;
     });
   }
 

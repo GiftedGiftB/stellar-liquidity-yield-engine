@@ -246,13 +246,22 @@ impl StellarLiquidityYieldEngine {
     }
 
     /// Panic unless the contract is unpaused.
+    ///
+    /// Safety checklist item P-1: every state-mutating entrypoint that is not
+    /// itself an emergency control (pause/unpause/upgrade/migrate) must call
+    /// this guard before touching storage. Verified by
+    /// `test_paused_blocks_state_mutations`.
     fn require_not_paused(env: &Env) {
         if Self::is_paused(env.clone()) {
             env.panic_with_error(EngineError::Paused);
         }
     }
 
-    /// Require admin authorization
+    /// Require admin authorization.
+    ///
+    /// Safety checklist item A-1: privileged entrypoints must compare the
+    /// caller against the stored admin and panic otherwise. Verified by
+    /// `test_non_admin_cannot_pause` and `test_non_admin_cannot_update_admin`.
     fn require_admin(env: &Env, caller: Address) {
         let admin = Self::get_admin(env.clone());
         if caller != admin {

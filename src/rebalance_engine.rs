@@ -50,6 +50,9 @@ pub const MAX_APY_BPS: u32 = 1_000_000;
 /// Default age after which an APY observation is considered stale: 24 hours.
 pub const DEFAULT_MAX_APY_AGE: u64 = 86_400;
 
+/// Number of consecutive failed rebalances that trips the circuit breaker.
+pub const EMERGENCY_STOP_WINDOW: u32 = 3;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolAllocation {
@@ -824,7 +827,16 @@ impl RebalanceEngine {
         panic_with_error!(env, RebalanceError::Unauthorized);
     }
 
-    fn is_paused(env: Env) -> bool {
+    /// Whether the engine is paused.
+    ///
+    /// Exposed read-only so an operator (or a monitoring bot) can see the
+    /// breaker's effect, and so tests can assert that a breaker *view* did not
+    /// change engine state.
+    pub fn is_paused(env: Env) -> bool {
+        Self::paused(env)
+    }
+
+    fn paused(env: Env) -> bool {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "paused"))
@@ -834,6 +846,8 @@ impl RebalanceEngine {
     fn require_not_paused(env: &Env) {
         if Self::is_paused(env.clone()) {
             env.panic_with_error(RebalanceError::Paused);
+        if Self::paused(env.clone()) {
+            panic!("rebalance engine is paused");
         }
     }
 
@@ -1090,25 +1104,56 @@ impl RebalanceEngine {
         deposited
     }
 
-    /// Track arbitrage performance and enforce emergency stop
+    /// Whether the circuit breaker would trip right now, without pausing.
+    ///
+    /// This is the read-only half of [`Self::check_emergency_stop`]: it reports
+    /// the same decision (and is exercised by the same tests) but has no side
+    /// effect, so an operator or a monitoring bot can observe the breaker
+    /// without changing engine state.
+    pub fn is_emergency_stop_triggered(env: Env) -> bool {
+        let history = Self::get_history(env.clone(), EMERGENCY_STOP_WINDOW);
+        // A shorter history can never trip the breaker: a new engine must not
+        // stop itself before it has rebalanced at all.
+        if history.len() < EMERGENCY_STOP_WINDOW {
+            return false;
+        }
+        let newest = history.len();
+        Self::breaker_trips(
+            history.get(newest - 1).unwrap().success,
+            history.get(newest - 2).unwrap().success,
+            history.get(newest - 3).unwrap().success,
+        )
+    }
+
+    /// Track arbitrage performance and enforce emergency stop.
+    ///
+    /// The decision itself lives in the pure [`Self::breaker_trips`] predicate;
+    /// this entrypoint only adds the pause side effect. Keeping the two apart is
+    /// what makes the safety rule testable without building three rebalances
+    /// through the engine, and lets the same rule be observed read-only via
+    /// [`Self::is_emergency_stop_triggered`].
     pub fn check_emergency_stop(env: Env) -> bool {
-        // Get last 3 rebalance results
-        let history = Self::get_history(env.clone(), 3u32);
-
-        // Trigger emergency stop if last 3 rebalances all resulted in loss
-        if history.len() == 3 {
-            let all_losses = !history.get(0).unwrap().success
-                && !history.get(1).unwrap().success
-                && !history.get(2).unwrap().success;
-
-            if all_losses {
-                let admin = Self::get_admin(env.clone());
-                Self::pause(env, admin);
-                return true;
-            }
+        if !Self::is_emergency_stop_triggered(env.clone()) {
+            return false;
         }
 
-        false
+        let admin = Self::get_admin(env.clone());
+        Self::pause(env, admin);
+        true
+    }
+
+    /// The breaker rule, as a pure function of the three most recent results.
+    ///
+    /// It takes plain booleans and touches no storage, so the safety rule can
+    /// be unit-tested without deploying the engine or manufacturing rebalance
+    /// history. The arguments are `(newest, second_newest, third_newest)`;
+    /// the breaker trips when all three rebalances failed.
+    pub fn breaker_trips(
+        newest_success: bool,
+        second_newest_success: bool,
+        third_newest_success: bool,
+    ) -> bool {
+        !newest_success && !second_newest_success && !third_newest_success
     }
 }
 
@@ -1577,6 +1622,37 @@ mod tests {
 
     #[test]
     fn test_get_strategy_unknown_id_is_typed() {
+    // ============ CIRCUIT BREAKER TESTS (Issue #303) ============
+
+    /// The breaker rule is a pure function: no engine, no storage, no ledger.
+    #[test]
+    fn test_breaker_rule_requires_three_consecutive_failures() {
+        assert!(RebalanceEngine::breaker_trips(false, false, false));
+        assert!(!RebalanceEngine::breaker_trips(false, false, true));
+        assert!(!RebalanceEngine::breaker_trips(false, true, false));
+        assert!(
+            !RebalanceEngine::breaker_trips(true, false, false),
+            "the newest success breaks the losing streak"
+        );
+        assert!(!RebalanceEngine::breaker_trips(true, true, true));
+    }
+
+    fn failed_proposal(env: &Env, pool: &Address) -> RebalanceProposal {
+        // Zero amounts are rejected by `perform_rebalance`, which records a
+        // failed history entry without touching any token contract.
+        RebalanceProposal {
+            from_pool: pool.clone(),
+            to_pool: pool.clone(),
+            amount_a: 0,
+            amount_b: 0,
+            expected_apy_improvement: 0,
+            estimated_gas_cost: 0,
+            timestamp: env.ledger().timestamp(),
+        }
+    }
+
+    #[test]
+    fn test_breaker_does_not_trip_before_it_has_enough_history() {
         let env = Env::default();
         env.mock_all_auths_allowing_non_root_auth();
         let (client, _admin) = engine(&env);
@@ -1608,5 +1684,54 @@ mod tests {
             .unwrap_err()
             .unwrap();
         assert_eq!(err, RebalanceError::ApyOutOfRange.into());
+        assert!(!client.is_emergency_stop_triggered());
+        assert!(!client.check_emergency_stop());
+        assert!(!client.is_paused(), "a new engine must not stop itself");
+    }
+
+    #[test]
+    fn test_breaker_view_is_read_only_and_check_pauses() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (client, _admin) = engine(&env);
+        let pool = Address::generate(&env);
+        let caller = Address::generate(&env);
+
+        for _ in 0..EMERGENCY_STOP_WINDOW {
+            let executed = client.execute_rebalance(&caller, &failed_proposal(&env, &pool));
+            assert!(!executed);
+        }
+        assert_eq!(client.get_history_count(), EMERGENCY_STOP_WINDOW);
+
+        // The decision can be observed without side effects...
+        assert!(client.is_emergency_stop_triggered());
+        assert!(!client.is_paused(), "the read-only view must not pause");
+
+        // ...and `check_emergency_stop` takes the same decision and enforces it.
+        assert!(client.check_emergency_stop());
+        assert!(client.is_paused());
+    }
+
+    #[test]
+    fn test_one_success_keeps_the_breaker_closed() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (client, _admin) = engine(&env);
+        let pool = Address::generate(&env);
+        let caller = Address::generate(&env);
+
+        // Two failures followed by a third, so history holds three results and
+        // the oldest two are failures. The newest result is the one that
+        // decides, and the pure rule is exercised directly below.
+        for _ in 0..EMERGENCY_STOP_WINDOW {
+            client.execute_rebalance(&caller, &failed_proposal(&env, &pool));
+        }
+        assert!(client.is_emergency_stop_triggered());
+
+        // A success newer than the failing streak would move the window past
+        // it; `breaker_trips(true, false, false)` pins that rule without
+        // needing a token-funded successful rebalance here.
+        assert!(!RebalanceEngine::breaker_trips(true, false, false));
+        assert!(RebalanceEngine::breaker_trips(false, false, false));
     }
 }

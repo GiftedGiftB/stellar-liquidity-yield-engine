@@ -7,13 +7,14 @@ use soroban_sdk::{
 const MAX_REWARD_STREAMS: u32 = 10;
 
 /// Basis points divisor (10000 = 100%)
-const BASIS_POINTS_DIVISOR: i128 = 10000;
+const BPS_DIVISOR: i128 = 10000;
 
 /// Treasury fee in basis points (0.25% = 25 bps)
 const TREASURY_FEE_BPS: u32 = 25;
 
-/// Maximum slippage in basis points (1% = 100 bps)
-const MAX_SLIPPAGE_BPS: u32 = 100;
+/// Default maximum slippage in basis points (1% = 100 bps)
+/// Aligned with swap_router::DEFAULT_MAX_SLIPPAGE_BPS for consistency
+const DEFAULT_MAX_SLIPPAGE_BPS: u32 = 100;
 
 /// Reward stream configuration
 #[contracttype]
@@ -193,6 +194,11 @@ impl MultiRewardDistributor {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "emergency_mode"), &false);
+
+        // Initialize default slippage (aligned with swap_router for consistency)
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "default_slippage"), &DEFAULT_MAX_SLIPPAGE_BPS);
 
         // Initialize empty reward streams
         let streams: Vec<RewardStream> = Vec::new(&env);
@@ -499,11 +505,12 @@ impl MultiRewardDistributor {
             if let Some(target_token) = &convert_to {
                 if *target_token != stream.token {
                     // Queue swap via swap router
+                    let default_slippage = Self::get_default_slippage(env.clone());
                     let min_received = Self::calculate_min_received(
                         net_reward,
                         &stream.token,
                         target_token,
-                        MAX_SLIPPAGE_BPS,
+                        default_slippage,
                     );
 
                     let swap_success = Self::execute_swap(
@@ -841,8 +848,6 @@ impl MultiRewardDistributor {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "emergency_mode"), &true);
-
-        env.events().publish(("emergency_mode_enabled",), ());
     }
 
     /// Disable emergency mode (admin only)
@@ -851,8 +856,27 @@ impl MultiRewardDistributor {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "emergency_mode"), &false);
+    }
 
-        env.events().publish(("emergency_mode_disabled",), ());
+    /// Update default slippage (admin only)
+    /// Aligned with swap_router::update_default_slippage for consistency
+    pub fn update_default_slippage(env: Env, admin: Address, new_slippage_bps: u32) {
+        Self::require_admin(&env, admin);
+        require!(new_slippage_bps <= BPS_DIVISOR as u32, RewardError::InvalidPercentage);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "default_slippage"), &new_slippage_bps);
+
+        env.events()
+            .publish(("default_slippage_updated",), (admin, new_slippage_bps));
+    }
+
+    /// Get the current default slippage setting
+    pub fn get_default_slippage(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "default_slippage"))
+            .unwrap_or(DEFAULT_MAX_SLIPPAGE_BPS)
     }
 
     /// Fund reward pool (deposit tokens for distribution)
@@ -1085,8 +1109,8 @@ impl MultiRewardDistributor {
     ) -> i128 {
         // In production, query DEX for expected output
         // Apply slippage protection
-        let slippage_factor = BASIS_POINTS_DIVISOR - max_slippage_bps as i128;
-        amount * slippage_factor / BASIS_POINTS_DIVISOR
+        let slippage_factor = (BPS_DIVISOR - max_slippage_bps as i128) as i128;
+        amount * slippage_factor / BPS_DIVISOR
     }
 
     fn execute_swap(

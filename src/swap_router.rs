@@ -6,8 +6,15 @@ use soroban_sdk::{
 /// Maximum path length for multi-hop swaps
 const MAX_PATH_LENGTH: u32 = 3;
 
-/// Maximum slippage in basis points (default 1%)
-const DEFAULT_MAX_SLIPPAGE_BPS: u32 = 100;
+/// Maximum permitted slippage tolerance in basis points (1% = 100 bps).
+///
+/// The router's existing default and the reward distributor's fixed tolerance
+/// are both 100 bps. Keeping the configurable value at or below that limit
+/// ensures a quote always retains at least 99% of its expected output.
+const MAX_SLIPPAGE_BPS: u32 = 100;
+
+/// Default slippage tolerance in basis points (1%).
+const DEFAULT_MAX_SLIPPAGE_BPS: u32 = MAX_SLIPPAGE_BPS;
 
 /// Treasury fee in basis points (0.25%)
 const PROTOCOL_TREASURY_FEE_BPS: u32 = 25;
@@ -36,6 +43,62 @@ pub struct PoolInfo {
     pub reserve_b: i128,
     pub fee_bps: u32,                // Trading fee in basis points
     pub is_stable_swap: bool,        // Stable swap pool (lower slippage)
+}
+
+impl PoolInfo {
+    /// Calculate depth score for pool selection
+    /// Higher score indicates better liquidity depth
+    /// Uses geometric mean of reserves to account for balanced liquidity
+    pub fn depth_score(&self) -> i128 {
+        // Use geometric mean: sqrt(reserve_a * reserve_b)
+        // This favors pools with balanced liquidity over skewed reserves
+        let product = self.reserve_a * self.reserve_b;
+        if product <= 0 {
+            return 0;
+        }
+        
+        // Integer square root approximation
+        self.isqrt(product)
+    }
+    
+    /// Integer square root using binary search
+    fn isqrt(n: i128) -> i128 {
+        if n <= 1 {
+            return n;
+        }
+        
+        let mut low = 1i128;
+        let mut high = n;
+        let mut result = 1i128;
+        
+        while low <= high {
+            let mid = (low + high) / 2;
+            let square = mid * mid;
+            
+            if square == n {
+                return mid;
+            } else if square < n {
+                result = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        
+        result
+    }
+    
+    /// Get total liquidity (sum of reserves)
+    pub fn total_liquidity(&self) -> i128 {
+        self.reserve_a + self.reserve_b
+    }
+    
+    /// Check if pool has sufficient liquidity for a given amount
+    /// Returns true if reserves are at least 10x the input amount
+    pub fn has_sufficient_liquidity(&self, input_amount: i128) -> bool {
+        let min_reserve = self.reserve_a.min(self.reserve_b);
+        min_reserve >= input_amount * 10
+    }
 }
 
 /// Swap quote result
@@ -224,8 +287,8 @@ impl SwapRouter {
     ) -> SwapQuote {
         require!(input_amount > 0, SwapError::InvalidPath);
         
-        let slippage = max_slippage_bps.unwrap_or(DEFAULT_MAX_SLIPPAGE_BPS);
-        require!(slippage <= BPS_DIVISOR as u32, SwapError::InvalidSlippage);
+        let slippage = max_slippage_bps.unwrap_or_else(|| Self::get_default_slippage(env.clone()));
+        Self::require_valid_slippage(slippage);
         
         // Find best path
         let (path, route_type) = Self::find_best_path(&env, &input_token, &output_token, input_amount);
@@ -273,7 +336,10 @@ impl SwapRouter {
                     input_amount,
                 );
                 
-                let minimum_output = Self::calculate_minimum_output(expected_output, DEFAULT_MAX_SLIPPAGE_BPS);
+                let minimum_output = Self::calculate_minimum_output(
+                    expected_output,
+                    Self::get_default_slippage(env.clone()),
+                );
                 let protocol_fee = (expected_output * PROTOCOL_TREASURY_FEE_BPS as i128) / BPS_DIVISOR;
                 
                 let path = SwapPath {
@@ -480,8 +546,20 @@ impl SwapRouter {
     /// Update default slippage (admin only)
     pub fn update_default_slippage(env: Env, admin: Address, new_slippage_bps: u32) {
         Self::require_admin(&env, admin);
-        require!(new_slippage_bps <= BPS_DIVISOR as u32, SwapError::InvalidSlippage);
+        Self::require_valid_slippage(new_slippage_bps);
         env.storage().instance().set(&Symbol::new(&env, "default_slippage"), &new_slippage_bps);
+    }
+
+    /// Return the configured default slippage tolerance in basis points.
+    pub fn get_default_slippage(env: Env) -> u32 {
+        let slippage = env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "default_slippage"))
+            .unwrap_or(DEFAULT_MAX_SLIPPAGE_BPS);
+        // Do not let a legacy or corrupted persisted value silently weaken
+        // protection when it is consumed by a quote.
+        Self::require_valid_slippage(slippage);
+        slippage
     }
 
     /// Update treasury address (admin only)
@@ -580,9 +658,8 @@ impl SwapRouter {
         require!(caller == admin, SwapError::Unauthorized);
     }
 
-    fn require_admin_ref(env: &Env, caller: &Address) {
-        let admin = Self::get_admin(env.clone());
-        require!(caller == &admin, SwapError::Unauthorized);
+    fn require_valid_slippage(slippage_bps: u32) {
+        require!(slippage_bps <= MAX_SLIPPAGE_BPS, SwapError::InvalidSlippage);
     }
 
     fn require_not_paused(env: &Env) {
@@ -678,21 +755,30 @@ impl SwapRouter {
         )
     }
 
-    /// Find direct pool path
+    /// Find direct pool path with depth-aware selection
+    /// Returns the pool with the highest depth score for the token pair
     fn find_direct_path(env: &Env, token_a: &Address, token_b: &Address) -> Option<PoolInfo> {
         let pools = Self::get_pools(env);
+        let mut best_pool: Option<PoolInfo> = None;
+        let mut best_depth_score: i128 = 0;
         
         for (_, pool) in pools.iter() {
             if (pool.token_a == *token_a && pool.token_b == *token_b) ||
                (pool.token_a == *token_b && pool.token_b == *token_a) {
-                return Some(pool);
+                
+                let depth_score = pool.depth_score();
+                if depth_score > best_depth_score {
+                    best_depth_score = depth_score;
+                    best_pool = Some(pool);
+                }
             }
         }
         
-        None
+        best_pool
     }
 
-    /// Find path through XLM
+    /// Find path through XLM with depth-aware selection
+    /// Selects pools with highest depth scores for both legs
     fn find_xlm_hop_path(
         env: &Env,
         input_token: &Address,
@@ -701,10 +787,10 @@ impl SwapRouter {
     ) -> Option<SwapPath> {
         let xlm = Self::get_xlm_token(env);
         
-        // Find input -> XLM pool
+        // Find input -> XLM pool (already depth-aware via find_direct_path)
         let input_pool = Self::find_direct_path(env, input_token, &xlm)?;
         
-        // Find XLM -> output pool
+        // Find XLM -> output pool (already depth-aware via find_direct_path)
         let output_pool = Self::find_direct_path(env, &xlm, output_token)?;
         
         // Calculate output through both pools
@@ -759,7 +845,7 @@ impl SwapRouter {
         None
     }
 
-    /// BFS helper for path finding
+    /// BFS helper for path finding with depth-aware pool selection
     fn bfs_find_path(
         env: &Env,
         current: &Address,
@@ -774,30 +860,52 @@ impl SwapRouter {
         
         let pools = Self::get_pools(env);
         
+        // Collect all pools that connect to current token with their depth scores
+        let mut pool_candidates: Vec<(PoolInfo, Address)> = Vec::new(env);
+        
         for (_, pool) in pools.iter() {
-            let next_token = if pool.token_a == *current {
+            if let Some(next_token) = if pool.token_a == *current {
                 Some(pool.token_b.clone())
             } else if pool.token_b == *current {
                 Some(pool.token_a.clone())
             } else {
                 None
-            }?;
-            
-            // Skip if already visited
-            let mut already_visited = false;
-            for v in visited.iter() {
-                if v == &next_token {
-                    already_visited = true;
-                    break;
+            } {
+                // Skip if already visited
+                let mut already_visited = false;
+                for v in visited.iter() {
+                    if v == &next_token {
+                        already_visited = true;
+                        break;
+                    }
+                }
+                if !already_visited {
+                    pool_candidates.push_back((pool, next_token));
                 }
             }
-            if already_visited {
-                continue;
+        }
+        
+        // Sort by depth score (highest first) using simple bubble sort
+        // In production, consider using a more efficient sorting algorithm
+        let n = pool_candidates.len();
+        for i in 0..n {
+            for j in 0..(n - i - 1) {
+                let (pool_a, _) = pool_candidates.get(j).unwrap();
+                let (pool_b, _) = pool_candidates.get(j + 1).unwrap();
+                if pool_a.depth_score() < pool_b.depth_score() {
+                    // Swap
+                    let temp = pool_candidates.get(j).unwrap().clone();
+                    pool_candidates.set(j, pool_candidates.get(j + 1).unwrap().clone());
+                    pool_candidates.set(j + 1, temp);
+                }
             }
-            
+        }
+        
+        // Try pools in order of depth score (highest first)
+        for (pool, next_token) in pool_candidates.iter() {
             // Calculate output for this leg
             let output = Self::calculate_direct_swap_output_for_pool(
-                &pool,
+                pool,
                 current,
                 amount,
             )?;

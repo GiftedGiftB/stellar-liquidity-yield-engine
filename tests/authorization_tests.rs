@@ -7,7 +7,7 @@ use stellar_liquidity_yield_engine::{
 
 fn main() {}
 
-mod tests {
+mod authorization_tests {
     use super::*;
     use soroban_sdk::token::{StellarAssetClient, TokenClient};
 

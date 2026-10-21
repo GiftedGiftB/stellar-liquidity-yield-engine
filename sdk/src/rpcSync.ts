@@ -135,6 +135,74 @@ export async function checkRpcLag(
 
 export type RpcLagWarnHandler = (report: RpcLagReport) => void;
 
+/**
+ * Health metrics for a keeper's RPC synchronization loop, suitable for
+ * exposing to ops tooling (Prometheus, logs, health endpoints).
+ */
+export interface KeeperHealthMetrics {
+  /** When the last successful run completed, in ms since the epoch (0 if none). */
+  lastSuccessfulRunMs: number;
+  /** Total number of failed runs observed. */
+  errorCount: number;
+  /** Number of items currently waiting to be processed. */
+  queueDepth: number;
+  /** Severity of the most recent lag check, if one has run. */
+  lastSeverity?: LagSeverity;
+}
+
+/**
+ * Collects keeper health signals (last successful run, error count, queue
+ * depth) so they can be emitted to monitoring. All methods are cheap and
+ * synchronous, making this safe to call from hot paths.
+ */
+export class KeeperHealthTracker {
+  private lastSuccessfulRunMs = 0;
+  private errorCount = 0;
+  private queueDepth = 0;
+  private lastSeverity?: LagSeverity;
+  private readonly now: () => number;
+
+  constructor(now: () => number = Date.now) {
+    this.now = now;
+  }
+
+  /** Record a successful run, stamping the current time. */
+  recordSuccess(): void {
+    this.lastSuccessfulRunMs = this.now();
+  }
+
+  /** Record a failed run. */
+  recordError(): void {
+    this.errorCount += 1;
+  }
+
+  /** Set the current queue depth (clamped at zero). */
+  setQueueDepth(depth: number): void {
+    if (!Number.isFinite(depth)) {
+      throw new Error('queue depth must be a finite number');
+    }
+    this.queueDepth = Math.max(0, Math.floor(depth));
+  }
+
+  /** Record the severity from a lag check. */
+  recordSeverity(severity: LagSeverity): void {
+    this.lastSeverity = severity;
+  }
+
+  /** Snapshot the current health metrics. */
+  getMetrics(): KeeperHealthMetrics {
+    const metrics: KeeperHealthMetrics = {
+      lastSuccessfulRunMs: this.lastSuccessfulRunMs,
+      errorCount: this.errorCount,
+      queueDepth: this.queueDepth,
+    };
+    if (this.lastSeverity !== undefined) {
+      metrics.lastSeverity = this.lastSeverity;
+    }
+    return metrics;
+  }
+}
+
 function defaultWarnHandler(report: RpcLagReport): void {
   // eslint-disable-next-line no-console
   console.warn(`[rpc-lag] ${report.message}`);
@@ -182,5 +250,22 @@ export class RpcLagMonitor {
       this.onWarn(report);
     }
     return report;
+  }
+
+  /**
+   * Run a check and feed the outcome into a health tracker: a successful check
+   * stamps the last-successful-run time and records severity, while a thrown
+   * error increments the error count before being re-thrown.
+   */
+  async checkWithHealth(tracker: KeeperHealthTracker): Promise<RpcLagReport> {
+    try {
+      const report = await this.check();
+      tracker.recordSuccess();
+      tracker.recordSeverity(report.severity);
+      return report;
+    } catch (err) {
+      tracker.recordError();
+      throw err;
+    }
   }
 }

@@ -1,9 +1,12 @@
 import {
+  ArbitrageExecutor,
   ArbitrageOptimizer,
   ArbitrageScanner,
   calculateConfidence,
   HorizonVolatilitySource,
   realizedVolatilityBp,
+  RoundTripCostEstimate,
+  RoundTripCostEstimator,
   VolatilityMetrics,
   VolatilitySource,
 } from './arbitrage';
@@ -154,8 +157,23 @@ describe('ArbitrageScanner volatility integration', () => {
     getVolatility: async () => metrics,
   });
 
-  const buildScanner = (source: VolatilitySource) =>
-    new ArbitrageScanner('https://horizon.test', { volatilitySource: source });
+  const zeroCostEstimator: RoundTripCostEstimator = {
+    estimateRoundTripCosts: async ({ asset }) => ({
+      asset,
+      networkCost: BigInt(0),
+      executionCost: BigInt(0),
+      protocolCost: BigInt(0),
+    }),
+  };
+
+  const buildScanner = (
+    source: VolatilitySource,
+    roundTripCostEstimator = zeroCostEstimator,
+  ) =>
+    new ArbitrageScanner('https://horizon.test', {
+      volatilitySource: source,
+      roundTripCostEstimator,
+    });
 
   it('uses real volatility from the source and rounds to whole basis points', async () => {
     const scanner = buildScanner(
@@ -205,7 +223,11 @@ describe('ArbitrageScanner volatility integration', () => {
         },
       ]);
 
-    const opportunities = await scanner.findOpportunities(1000);
+    const opportunities = await scanner.findOpportunities(1000, 200, 100, {
+      investmentAmount: BigInt(1_000_000),
+      investmentAsset: 'USDC',
+      sourcePoolId: 'current-pool',
+    });
 
     expect(opportunities.map((opportunity) => opportunity.pool_id)).toEqual([
       'low-vol-pool',
@@ -305,5 +327,213 @@ describe('ArbitrageOptimizer confidence-weighted ranking', () => {
 
     // With moderate risk tolerance (5), lower risk should win despite lower confidence
     expect(ranked[0].pool_id).toBe('pool-a');
+  });
+});
+
+describe('ArbitrageScanner round-trip cost scoring', () => {
+  const source: VolatilitySource = {
+    getVolatility: async () => ({ volatility_24h: 100, volatility_7d: 100 }),
+  };
+  const amount = BigInt(10_000);
+  const scanOptions = {
+    investmentAmount: amount,
+    investmentAsset: 'USDC',
+    sourcePoolId: 'source-pool',
+  };
+  const makePool = (poolId: string, apy: number) => ({
+    pool_id: poolId,
+    current_apy: apy,
+    total_liquidity: BigInt(1_000_000),
+    reserve_a: BigInt(500_000),
+    reserve_b: BigInt(500_000),
+    volatility_24h: 100,
+    volatility_7d: 100,
+  });
+  const buildScanner = (
+    pools: ReturnType<typeof makePool>[],
+    estimator?: RoundTripCostEstimator,
+  ) => {
+    const scanner = new ArbitrageScanner('https://horizon.test', {
+      volatilitySource: source,
+      roundTripCostEstimator: estimator,
+    });
+    jest.spyOn(scanner, 'scanAllPools').mockResolvedValue(pools);
+    return scanner;
+  };
+  const fixedCosts = (
+    costs: (poolId: string) => { networkCost: bigint; executionCost: bigint; protocolCost: bigint } | null,
+    asset = 'USDC',
+  ): RoundTripCostEstimator => ({
+    estimateRoundTripCosts: async ({ destinationPoolId }) => {
+      const estimate = costs(destinationPoolId);
+      return estimate ? { ...estimate, asset } : null;
+    },
+  });
+
+  it('rejects grossly attractive opportunities whose round-trip costs exceed one year of gain', async () => {
+    const scanner = buildScanner(
+      [makePool('expensive', 2000)],
+      fixedCosts(() => ({
+        networkCost: BigInt(1),
+        executionCost: BigInt(900),
+        protocolCost: BigInt(200),
+      })),
+    );
+
+    expect(await scanner.findOpportunities(1000, 100, 100, scanOptions)).toEqual([]);
+  });
+
+  it('keeps opportunities profitable after round-trip costs and separates gross from net', async () => {
+    const scanner = buildScanner(
+      [makePool('profitable', 2000)],
+      fixedCosts(() => ({
+        networkCost: BigInt(10),
+        executionCost: BigInt(50),
+        protocolCost: BigInt(40),
+      })),
+    );
+
+    const [opportunity] = await scanner.findOpportunities(1000, 100, 100, scanOptions);
+
+    expect(opportunity.gross_profit).toBe(BigInt(1000));
+    expect(opportunity.round_trip_cost).toBe(BigInt(100));
+    expect(opportunity.net_profit).toBe(BigInt(900));
+    expect(opportunity.recommended).toBe(true);
+
+    const profitability = ArbitrageOptimizer.calculateProfitability(opportunity, amount);
+    expect(profitability.costEstimateAvailable).toBe(true);
+    expect(profitability.grossProfit).toBe(BigInt(1000));
+    expect(profitability.netProfit).toBe(BigInt(800));
+
+    const simulation = await new ArbitrageExecutor('https://horizon.test').simulateRebalance(
+      opportunity,
+      amount,
+    );
+    expect(simulation.costEstimateAvailable).toBe(true);
+    expect(simulation.totalCost).toBe(BigInt(200)); // 100 fees + 100 bp IL risk
+    expect(simulation.netProfit).toBe(BigInt(800));
+
+    const unsafeRiskOpportunity = { ...opportunity, il_risk: 2000 };
+    await expect(
+      new ArbitrageExecutor('https://horizon.test').executeArbitrage(
+        unsafeRiskOpportunity,
+        'source-pool',
+        amount,
+        '',
+      ),
+    ).resolves.toMatchObject({
+      success: false,
+      error: 'Opportunity is not profitable after round-trip costs and IL risk',
+    });
+  });
+
+  it('ranks competing opportunities by net return rather than gross APY', async () => {
+    const scanner = buildScanner(
+      [makePool('high-gross', 3000), makePool('low-cost', 2500)],
+      fixedCosts((poolId) =>
+        poolId === 'high-gross'
+          ? { networkCost: BigInt(0), executionCost: BigInt(1800), protocolCost: BigInt(0) }
+          : { networkCost: BigInt(0), executionCost: BigInt(100), protocolCost: BigInt(0) },
+      ),
+    );
+
+    const opportunities = await scanner.findOpportunities(1000, 100, 100, scanOptions);
+
+    expect(opportunities.map((opportunity) => opportunity.pool_id)).toEqual([
+      'low-cost',
+      'high-gross',
+    ]);
+    expect(opportunities[0].net_profit).toBeGreaterThan(opportunities[1].net_profit);
+  });
+
+  it('preserves gross scoring order for negligible costs while requiring positive net profit', async () => {
+    const scanner = buildScanner(
+      [makePool('larger-return', 2500), makePool('smaller-return', 2000)],
+      fixedCosts(() => ({
+        networkCost: BigInt(0),
+        executionCost: BigInt(0),
+        protocolCost: BigInt(0),
+      })),
+    );
+
+    const opportunities = await scanner.findOpportunities(1000, 100, 100, scanOptions);
+
+    expect(opportunities.map((opportunity) => opportunity.pool_id)).toEqual([
+      'larger-return',
+      'smaller-return',
+    ]);
+  });
+
+  it('fails closed for missing estimators, missing estimates, negative values, and mismatched assets', async () => {
+    const pool = [makePool('candidate', 2000)];
+    const withoutEstimator = buildScanner(pool);
+    const noEstimate = buildScanner(pool, fixedCosts(() => null));
+    const negativeEstimate = buildScanner(
+      pool,
+      fixedCosts(() => ({
+        networkCost: BigInt(-1),
+        executionCost: BigInt(0),
+        protocolCost: BigInt(0),
+      })),
+    );
+    const wrongAsset = buildScanner(
+      pool,
+      fixedCosts(
+        () => ({ networkCost: BigInt(0), executionCost: BigInt(0), protocolCost: BigInt(0) }),
+        'XLM',
+      ),
+    );
+    const failingEstimator: RoundTripCostEstimator = {
+      estimateRoundTripCosts: async () => {
+        throw new Error('quote unavailable');
+      },
+    };
+    const malformedEstimator: RoundTripCostEstimator = {
+      estimateRoundTripCosts: async () =>
+        ({
+          asset: 'USDC',
+          networkCost: '0',
+          executionCost: BigInt(0),
+          protocolCost: BigInt(0),
+        } as unknown as RoundTripCostEstimate),
+    };
+    const failedEstimate = buildScanner(pool, failingEstimator);
+    const malformedEstimate = buildScanner(pool, malformedEstimator);
+
+    await expect(withoutEstimator.findOpportunities(1000, 100, 100, scanOptions)).resolves.toEqual([]);
+    await expect(noEstimate.findOpportunities(1000, 100, 100, scanOptions)).resolves.toEqual([]);
+    await expect(negativeEstimate.findOpportunities(1000, 100, 100, scanOptions)).resolves.toEqual([]);
+    await expect(wrongAsset.findOpportunities(1000, 100, 100, scanOptions)).resolves.toEqual([]);
+    await expect(failedEstimate.findOpportunities(1000, 100, 100, scanOptions)).resolves.toEqual([]);
+    await expect(malformedEstimate.findOpportunities(1000, 100, 100, scanOptions)).resolves.toEqual([]);
+  });
+
+  it('rejects costs equal to gains and handles zero and unusually large values exactly', async () => {
+    const equalCost = buildScanner(
+      [makePool('break-even', 2000)],
+      fixedCosts(() => ({
+        networkCost: BigInt(0),
+        executionCost: BigInt(1000),
+        protocolCost: BigInt(0),
+      })),
+    );
+    expect(await equalCost.findOpportunities(1000, 0, 100, scanOptions)).toEqual([]);
+    expect(await equalCost.findOpportunities(2000, 0, 100, scanOptions)).toEqual([]);
+
+    const largeAmount = BigInt('100000000000000000000000000000000000000');
+    const largeScanner = buildScanner(
+      [makePool('large', 2000)],
+      fixedCosts(() => ({
+        networkCost: BigInt(0),
+        executionCost: BigInt(1),
+        protocolCost: BigInt(0),
+      })),
+    );
+    const [largeOpportunity] = await largeScanner.findOpportunities(1000, 100, 100, {
+      ...scanOptions,
+      investmentAmount: largeAmount,
+    });
+    expect(largeOpportunity.gross_profit).toBe((largeAmount * BigInt(1000)) / BigInt(10000));
+    expect(largeOpportunity.net_profit).toBe(largeOpportunity.gross_profit! - BigInt(1));
   });
 });

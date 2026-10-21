@@ -1,3 +1,7 @@
+//! Strategy registry contract.
+//!
+//! See `docs/SECURITY_CHECKLIST.md` for the pause / access-control /
+//! fee-routing / reentrancy assumptions this contract is verified against.
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, Map,
     Symbol, Vec,
@@ -680,6 +684,7 @@ impl StrategyRegistry {
 
     fn require_admin(env: &Env, caller: Address) {
         let admin = Self::get_admin(env.clone());
+        caller.require_auth();
         if caller != admin {
             panic_with_error!(env, RegistryError::Unauthorized);
         }
@@ -701,6 +706,7 @@ impl StrategyRegistry {
     /// Pause strategy registry (admin only)
     pub fn pause(env: Env, admin: Address) {
         Self::require_admin(&env, admin.clone());
+        require!(!Self::is_paused(env.clone()), "already paused");
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "paused"), &true);
@@ -711,11 +717,17 @@ impl StrategyRegistry {
     /// Unpause strategy registry (admin only)
     pub fn unpause(env: Env, admin: Address) {
         Self::require_admin(&env, admin.clone());
+        require!(Self::is_paused(env.clone()), "not paused");
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "paused"), &false);
         env.events()
             .publish((Symbol::new(&env, "registry_unpaused"),), (admin,));
+    }
+
+    /// Read-only pause status, for keepers and off-chain monitors.
+    pub fn is_paused_view(env: Env) -> bool {
+        Self::is_paused(env)
     }
 }
 
@@ -726,6 +738,7 @@ mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{Env, Symbol, Vec};
+    use soroban_sdk::testutils::Events as _;
 
     fn fee_structure() -> FeeStructure {
         FeeStructure {
@@ -1198,5 +1211,148 @@ mod tests {
         let stranger = Address::generate(&env);
         let err = client.try_pause(&stranger).unwrap_err().unwrap();
         assert_eq!(err, RegistryError::Unauthorized.into());
+    // --- Security checklist verification (docs/SECURITY_CHECKLIST.md) ---
+
+    #[test]
+    fn test_pause_blocks_update_and_record_performance() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (admin, creator, client) = setup(&env);
+
+        let strategy_id = register(&env, &client, &creator);
+        client.approve_strategy(&admin, &strategy_id, &Symbol::new(&env, "Approved"));
+        client.pause(&admin);
+
+        let update_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.update_strategy(
+                &creator,
+                &strategy_id,
+                &Symbol::new(&env, "Paused"),
+                &Symbol::new(&env, "Paused"),
+                &2,
+                &1_000i128,
+                &500_000i128,
+                &fee_structure(),
+                &strategy_parameters(&env),
+            );
+        }));
+        expect_panic(update_result);
+
+        let record_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.record_performance(&strategy_id, &10_000i128, &1_000u32, &500u32, &200u32);
+        }));
+        expect_panic(record_result);
+
+        assert!(client.get_performance_history(&strategy_id, &10).is_empty());
+    }
+
+    #[test]
+    fn test_pause_is_idempotent_guarded_and_reports_status() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (admin, _creator, client) = setup(&env);
+
+        assert!(!client.is_paused_view());
+        client.pause(&admin);
+        assert!(client.is_paused_view());
+
+        let second_pause = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.pause(&admin);
+        }));
+        expect_panic(second_pause);
+
+        client.unpause(&admin);
+        assert!(!client.is_paused_view());
+
+        let second_unpause = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.unpause(&admin);
+        }));
+        expect_panic(second_unpause);
+    }
+
+    #[test]
+    fn test_only_admin_can_pause_and_unpause() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (admin, _creator, client) = setup(&env);
+        let attacker = Address::generate(&env);
+
+        let pause_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.pause(&attacker);
+        }));
+        expect_panic(pause_result);
+        assert!(!client.is_paused_view());
+
+        client.pause(&admin);
+        let unpause_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.unpause(&attacker);
+        }));
+        expect_panic(unpause_result);
+        assert!(client.is_paused_view());
+    }
+
+    #[test]
+    fn test_pause_emits_audit_events() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (admin, _creator, client) = setup(&env);
+
+        client.pause(&admin);
+        client.unpause(&admin);
+
+        let events = env.events().all();
+        let mut saw_pause = false;
+        let mut saw_unpause = false;
+        for (topics, _data) in events.iter() {
+            let first = topics.get(0).unwrap();
+            let sym: Symbol = first.try_into().unwrap();
+            if sym == Symbol::new(&env, "registry_paused") {
+                saw_pause = true;
+            }
+            if sym == Symbol::new(&env, "registry_unpaused") {
+                saw_unpause = true;
+            }
+        }
+        assert!(saw_pause, "pause must emit registry_paused event");
+        assert!(saw_unpause, "unpause must emit registry_unpaused event");
+    }
+
+    #[test]
+    fn test_register_rejects_invalid_investment_bounds() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (_admin, creator, client) = setup(&env);
+
+        // Non-positive min investment.
+        let zero_min = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.register_strategy(
+                &creator,
+                &Symbol::new(&env, "Bad"),
+                &Symbol::new(&env, "Bad"),
+                &2,
+                &0i128,
+                &500_000i128,
+                &fee_structure(),
+                &strategy_parameters(&env),
+            );
+        }));
+        expect_panic(zero_min);
+
+        // max < min.
+        let inverted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.register_strategy(
+                &creator,
+                &Symbol::new(&env, "Bad"),
+                &Symbol::new(&env, "Bad"),
+                &2,
+                &500_000i128,
+                &1_000i128,
+                &fee_structure(),
+                &strategy_parameters(&env),
+            );
+        }));
+        expect_panic(inverted);
+
+        assert_eq!(client.get_strategy_count(), 0u32);
     }
 }
