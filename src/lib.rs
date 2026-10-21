@@ -42,12 +42,12 @@ mod rebalance_engine;
 mod reward_distributor;
 #[cfg(feature = "strategy-registry")]
 mod strategy_registry;
-#[cfg(feature = "il-insurance")]
-mod il_insurance;
-#[cfg(feature = "actuary")]
-mod actuary;
+#[cfg(any(feature = "yield-vault", feature = "rebalance-engine"))]
+mod yield_vault;
 #[cfg(feature = "oracle-registry")]
 mod oracle_registry;
+#[cfg(feature = "risk-engine")]
+mod risk_engine;
 
 #[cfg(feature = "actuary")]
 pub use actuary::*;
@@ -59,12 +59,12 @@ pub use rebalance_engine::*;
 pub use reward_distributor::*;
 #[cfg(feature = "strategy-registry")]
 pub use strategy_registry::*;
-#[cfg(feature = "il-insurance")]
-pub use il_insurance::*;
-#[cfg(feature = "actuary")]
-pub use actuary::*;
+#[cfg(feature = "yield-vault")]
+pub use yield_vault::*;
 #[cfg(feature = "oracle-registry")]
 pub use oracle_registry::*;
+#[cfg(feature = "risk-engine")]
+pub use risk_engine::*;
 
 #[cfg(feature = "engine")]
 #[contract]

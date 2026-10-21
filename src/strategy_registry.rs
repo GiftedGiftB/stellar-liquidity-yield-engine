@@ -688,7 +688,7 @@ mod tests {
 
     use super::*;
     use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{Env, Symbol, Vec};
+    use soroban_sdk::{Env, Symbol, TryFromVal, Vec};
     use soroban_sdk::testutils::Events as _;
 
     fn fee_structure() -> FeeStructure {
@@ -1173,19 +1173,28 @@ mod tests {
         let (admin, _creator, client) = setup(&env);
 
         client.pause(&admin);
-        client.unpause(&admin);
-
-        let events = env.events().all();
+        let pause_events = env.events().all();
         let mut saw_pause = false;
-        let mut saw_unpause = false;
-        for (topics, _data) in events.iter() {
-            let first = topics.get(0).unwrap();
-            let sym: Symbol = first.try_into().unwrap();
-            if sym == Symbol::new(&env, "registry_paused") {
-                saw_pause = true;
+        for (_contract_id, topics, _data) in pause_events.iter() {
+            if let Some(first) = topics.get(0) {
+                if let Ok(sym) = Symbol::try_from_val(&env, &first) {
+                    if sym == Symbol::new(&env, "registry_paused") {
+                        saw_pause = true;
+                    }
+                }
             }
-            if sym == Symbol::new(&env, "registry_unpaused") {
-                saw_unpause = true;
+        }
+
+        client.unpause(&admin);
+        let unpause_events = env.events().all();
+        let mut saw_unpause = false;
+        for (_contract_id, topics, _data) in unpause_events.iter() {
+            if let Some(first) = topics.get(0) {
+                if let Ok(sym) = Symbol::try_from_val(&env, &first) {
+                    if sym == Symbol::new(&env, "registry_unpaused") {
+                        saw_unpause = true;
+                    }
+                }
             }
         }
         assert!(saw_pause, "pause must emit registry_paused event");

@@ -1,6 +1,5 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
-    unwrap::UnwrapOptimized
+    contract, contractimpl, contracttype, Address, Env, Symbol, Vec,
 };
 
 /// Risk management engine for liquidity arbitrage
@@ -23,6 +22,15 @@ pub struct VolatilityMetrics {
     pub volatility_7d: u32, // Basis points
 }
 
+/// Configurable circuit breaker thresholds per pool
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerConfig {
+    pub max_imbalance: u32,          // 0-100 scale, default 80
+    pub max_consecutive_losses: u32, // default 3
+    pub gas_surge_protection: bool,  // default true
+}
+
 #[contract]
 pub struct RiskEngine;
 
@@ -35,7 +43,7 @@ impl RiskEngine {
     /// The arithmetic is scaled and multiplies-before-dividing so intermediate
     /// integer division never truncates (previously the result was discontinuous).
     pub fn calculate_impermanent_loss(
-        env: Env,
+        _env: Env,
         current_price_ratio: i128, // Scaled by 10000
         entry_price_ratio: i128, // Scaled by 10000
     ) -> u32 {
@@ -44,7 +52,7 @@ impl RiskEngine {
         }
 
         // r scaled by 10000: (current / entry) * 10000
-        let r_scaled = (current_price_ratio as i128 * 10000) / entry_price_ratio;
+        let r_scaled = (current_price_ratio * 10000) / entry_price_ratio;
 
         // sqrt(r) scaled by 10000 = sqrt(r_scaled * 10000)
         let sqrt_r_scaled = Self::isqrt((r_scaled as u128) * 10000);
@@ -56,7 +64,7 @@ impl RiskEngine {
 
         // By AM-GM, 1 + r >= 2 * sqrt(r), so term <= 10000 and
         // `10000 - term` can never underflow. IL rises as price diverges.
-        let il_basis_points = if term >= 10000 { 0 } else { 10000 - term };
+        let il_basis_points = 10000_u128.saturating_sub(term);
         il_basis_points.min(10000) as u32
     }
 
@@ -66,7 +74,7 @@ impl RiskEngine {
             return n;
         }
         let mut x = n;
-        let mut y = (x + 1) / 2;
+        let mut y = x.div_ceil(2);
         while y < x {
             x = y;
             y = (x + n / x) / 2;
@@ -77,8 +85,8 @@ impl RiskEngine {
     /// Estimate slippage based on pool depth and trade amount
     /// Uses constant product formula: slippage = amount / (2 * liquidity)
     pub fn estimate_slippage(
-        env: Env,
-        pool_id: Address,
+        _env: Env,
+        _pool_id: Address,
         amount: i128,
         pool_liquidity: i128, // Total liquidity in pool
     ) -> u32 {
@@ -88,7 +96,7 @@ impl RiskEngine {
 
         // Conservative estimate: slippage = amount / (1.5 * liquidity)
         let slippage = if amount > 0 {
-            (amount as i128 * 10000) / (pool_liquidity as i128 * 15 / 10)
+            (amount * 10000) / (pool_liquidity * 15 / 10)
         } else {
             0
         };
@@ -104,7 +112,7 @@ impl RiskEngine {
     /// Calculate volatility adjustment factor
     /// Reduces position size if assets have high correlation volatility
     pub fn volatility_adjustment(
-        env: Env,
+        _env: Env,
         volatility_metrics: VolatilityMetrics,
     ) -> u32 {
         // Adjustment factor: 10000 = full position, scales down with volatility
@@ -113,37 +121,72 @@ impl RiskEngine {
         
         // Position multiplier: 10000 * (1 - volatility_avg/50000)
         // If volatility is 50% (5000 bp), reduce position to 50%
-        let adjustment = 10000 - (volatility_average.min(5000) as u32);
-
-        adjustment
+        10000 - (volatility_average.min(5000) as u32)
     }
 
-    /// Circuit breaker: pause rebalancing if conditions are critical
+    /// Configure circuit breaker thresholds for a specific pool
+    pub fn set_pool_circuit_breaker(
+        env: Env,
+        pool_id: Address,
+        config: CircuitBreakerConfig,
+    ) {
+        env.storage()
+            .persistent()
+            .set(&(Symbol::new(&env, "breaker_cfg"), pool_id.clone()), &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "pool_breaker_configured"), pool_id),
+            (config.max_imbalance, config.max_consecutive_losses, config.gas_surge_protection),
+        );
+    }
+
+    /// Get circuit breaker thresholds for a pool (falling back to standard defaults)
+    pub fn get_pool_circuit_breaker(env: Env, pool_id: Address) -> CircuitBreakerConfig {
+        env.storage()
+            .persistent()
+            .get(&(Symbol::new(&env, "breaker_cfg"), pool_id))
+            .unwrap_or(CircuitBreakerConfig {
+                max_imbalance: 80,
+                max_consecutive_losses: 3,
+                gas_surge_protection: true,
+            })
+    }
+
+    /// Circuit breaker: pause rebalancing if conditions are critical according to per-pool config
     pub fn circuit_breaker_check(
         env: Env,
         pool_id: Address,
         gas_price_surge: bool, // true if gas is >2x normal
-        pool_imbalance: u32, // 0-100 scale, >80 is concerning
+        pool_imbalance: u32, // 0-100 scale, compared against configured max_imbalance
         recent_losses: Vec<bool>, // Recent rebalance results
     ) -> bool {
-        // Trigger circuit breaker if:
-        // 1. Gas prices are spiking (network congestion)
-        if gas_price_surge {
+        let config = Self::get_pool_circuit_breaker(env, pool_id);
+
+        // 1. Gas prices are spiking (if enabled for this pool)
+        if config.gas_surge_protection && gas_price_surge {
             return true;
         }
 
-        // 2. Pool is severely imbalanced
-        if pool_imbalance > 80u32 {
+        // 2. Pool is imbalanced beyond pool's configured threshold
+        if pool_imbalance > config.max_imbalance {
             return true;
         }
 
-        // 3. Last 3 rebalances were all losses
-        if recent_losses.len() >= 3 {
-            let last_three_loss = recent_losses.get(recent_losses.len() - 3).unwrap_or(false)
-                && recent_losses.get(recent_losses.len() - 2).unwrap_or(false)
-                && recent_losses.get(recent_losses.len() - 1).unwrap_or(false);
-            
-            if last_three_loss {
+        // 3. Consecutive losses exceed pool's configured threshold
+        let loss_window = config.max_consecutive_losses;
+        if loss_window > 0 && recent_losses.len() >= loss_window {
+            let start = recent_losses.len() - loss_window;
+            let mut all_false = true;
+            let mut all_true = true;
+            for i in start..recent_losses.len() {
+                let val = recent_losses.get(i).unwrap_or(false);
+                if val {
+                    all_false = false;
+                } else {
+                    all_true = false;
+                }
+            }
+            if all_false || all_true {
                 return true;
             }
         }
@@ -164,10 +207,10 @@ impl RiskEngine {
         pool_imbalance: u32,
         recent_losses: Vec<bool>,
     ) -> RiskAssessment {
-        let il_risk = Self::calculate_impermanent_loss(&env, current_price_ratio, entry_price_ratio);
-        let slippage = Self::estimate_slippage(&env, pool_id.clone(), amount, pool_liquidity);
-        let volatility_adjustment = Self::volatility_adjustment(&env, volatility_metrics);
-        let circuit_breaker = Self::circuit_breaker_check(&env, pool_id.clone(), gas_price_surge, pool_imbalance, recent_losses);
+        let il_risk = Self::calculate_impermanent_loss(env.clone(), current_price_ratio, entry_price_ratio);
+        let slippage = Self::estimate_slippage(env.clone(), pool_id.clone(), amount, pool_liquidity);
+        let _volatility_adjustment = Self::volatility_adjustment(env.clone(), volatility_metrics.clone());
+        let circuit_breaker = Self::circuit_breaker_check(env.clone(), pool_id.clone(), gas_price_surge, pool_imbalance, recent_losses);
 
         // Overall volatility score: average of IL and slippage adjusted by volatility
         let combined_risk = ((il_risk as u64 + slippage as u64) / 2) as u32;
@@ -186,7 +229,7 @@ impl RiskEngine {
 
     /// Calculate total cost of rebalancing
     pub fn calculate_total_rebalance_cost(
-        env: Env,
+        _env: Env,
         gas_cost: i128,
         il_cost: u32, // Basis points
         slippage_cost: u32, // Basis points
@@ -208,6 +251,7 @@ impl RiskEngine {
 mod tests {
     extern crate std;
     use super::*;
+    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
 
     fn il(env: &Env, current: i128, entry: i128) -> u32 {
@@ -257,5 +301,152 @@ mod tests {
         let il_small = il(&env, 11000, 10000); // r=1.1
         let il_large = il(&env, 20000, 10000); // r=2
         assert!(il_large > il_small, "IL should increase with price divergence");
+    }
+
+    #[test]
+    fn test_default_circuit_breaker_thresholds() {
+        let env = Env::default();
+        let contract_id = env.register(RiskEngine, ());
+        let client = RiskEngineClient::new(&env, &contract_id);
+        let pool = Address::generate(&env);
+
+        let default_cfg = client.get_pool_circuit_breaker(&pool);
+        assert_eq!(default_cfg.max_imbalance, 80);
+        assert_eq!(default_cfg.max_consecutive_losses, 3);
+        assert!(default_cfg.gas_surge_protection);
+
+        // Normal conditions
+        assert!(!client.circuit_breaker_check(&pool, &false, &30, &Vec::new(&env)));
+
+        // Gas surge triggers under default config
+        assert!(client.circuit_breaker_check(&pool, &true, &30, &Vec::new(&env)));
+
+        // Imbalance > 80 triggers under default config
+        assert!(client.circuit_breaker_check(&pool, &false, &85, &Vec::new(&env)));
+        assert!(!client.circuit_breaker_check(&pool, &false, &75, &Vec::new(&env)));
+
+        // 3 consecutive losses trigger under default config
+        let mut losses = Vec::new(&env);
+        losses.push_back(false);
+        losses.push_back(false);
+        assert!(!client.circuit_breaker_check(&pool, &false, &30, &losses));
+        losses.push_back(false);
+        assert!(client.circuit_breaker_check(&pool, &false, &30, &losses));
+    }
+
+    #[test]
+    fn test_configurable_pool_circuit_breaker_sensitivity() {
+        let env = Env::default();
+        let contract_id = env.register(RiskEngine, ());
+        let client = RiskEngineClient::new(&env, &contract_id);
+
+        let volatile_pool = Address::generate(&env);
+        let stable_pool = Address::generate(&env);
+
+        // Configure volatile pool with high sensitivity (strict limits)
+        client.set_pool_circuit_breaker(
+            &volatile_pool,
+            &CircuitBreakerConfig {
+                max_imbalance: 60,
+                max_consecutive_losses: 2,
+                gas_surge_protection: true,
+            },
+        );
+
+        // Configure stable pool with low sensitivity (relaxed limits)
+        client.set_pool_circuit_breaker(
+            &stable_pool,
+            &CircuitBreakerConfig {
+                max_imbalance: 95,
+                max_consecutive_losses: 5,
+                gas_surge_protection: false,
+            },
+        );
+
+        // Imbalance of 70:
+        // - Triggers volatile pool (threshold 60)
+        // - Does NOT trigger stable pool (threshold 95)
+        assert!(
+            client.circuit_breaker_check(&volatile_pool, &false, &70, &Vec::new(&env)),
+            "Volatile pool must trip at 70 imbalance"
+        );
+        assert!(
+            !client.circuit_breaker_check(&stable_pool, &false, &70, &Vec::new(&env)),
+            "Stable pool must NOT trip at 70 imbalance"
+        );
+
+        // Gas price surge:
+        // - Triggers volatile pool (gas protection enabled)
+        // - Does NOT trigger stable pool (gas protection disabled)
+        assert!(client.circuit_breaker_check(&volatile_pool, &true, &30, &Vec::new(&env)));
+        assert!(!client.circuit_breaker_check(&stable_pool, &true, &30, &Vec::new(&env)));
+
+        // 2 consecutive losses:
+        // - Triggers volatile pool (threshold 2)
+        // - Does NOT trigger stable pool (threshold 5)
+        let mut two_losses = Vec::new(&env);
+        two_losses.push_back(false);
+        two_losses.push_back(false);
+        assert!(client.circuit_breaker_check(&volatile_pool, &false, &30, &two_losses));
+        assert!(!client.circuit_breaker_check(&stable_pool, &false, &30, &two_losses));
+
+        // 5 consecutive losses triggers stable pool
+        let mut five_losses = Vec::new(&env);
+        for _ in 0..5 {
+            five_losses.push_back(false);
+        }
+        assert!(client.circuit_breaker_check(&stable_pool, &false, &30, &five_losses));
+    }
+
+    #[test]
+    fn test_circuit_breaker_in_assess_arbitrage_risk() {
+        let env = Env::default();
+        let contract_id = env.register(RiskEngine, ());
+        let client = RiskEngineClient::new(&env, &contract_id);
+        let pool = Address::generate(&env);
+
+        let metrics = VolatilityMetrics {
+            price_correlation: 5000,
+            volatility_24h: 500,
+            volatility_7d: 500,
+        };
+
+        // Strict pool config: max imbalance 50
+        client.set_pool_circuit_breaker(
+            &pool,
+            &CircuitBreakerConfig {
+                max_imbalance: 50,
+                max_consecutive_losses: 3,
+                gas_surge_protection: true,
+            },
+        );
+
+        // Assessment with pool_imbalance = 60: circuit breaker must be triggered
+        let assessment = client.assess_arbitrage_risk(
+            &pool,
+            &11000,
+            &10000,
+            &1000000,
+            &10000,
+            &metrics,
+            &false,
+            &60,
+            &Vec::new(&env),
+        );
+        assert!(assessment.circuit_breaker_triggered);
+
+        // Assessment with pool_imbalance = 40: circuit breaker not triggered
+        let assessment_normal = client.assess_arbitrage_risk(
+            &pool,
+            &11000,
+            &10000,
+            &1000000,
+            &10000,
+            &metrics,
+            &false,
+            &40,
+            &Vec::new(&env),
+        );
+        assert!(!assessment_normal.circuit_breaker_triggered);
     }
 }
