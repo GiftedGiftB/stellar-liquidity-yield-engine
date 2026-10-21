@@ -1,8 +1,6 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token::TokenClient,
-    Address, Env, Symbol, Vec,
-    contract, contractimpl, contracttype, token::TokenClient, unwrap::UnwrapOptimized, Address,
-    Env, Map, Symbol, Vec,
+    Address, Env, Map, Symbol, Vec,
 };
 
 /// Typed failures of the yield vault.
@@ -678,6 +676,8 @@ impl YieldVault {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "metrics"), &metrics);
+    }
+
     /// Queue a change to the USD prices (scaled) used for TVL (admin only).
     ///
     /// Prices are an economic parameter: they change the value backing every
@@ -1817,8 +1817,11 @@ mod tests {
         let err = vault.try_deposit(&user, &-1, &0, &0).unwrap_err().unwrap();
         assert_eq!(err, VaultError::AmountBelowMinimum.into());
 
-        // A positive deposit below the configured minimum for one leg.
-        vault.set_min_deposit_amounts(&admin, &10, &0);
+        // A positive deposit below the configured minimum for one leg. The
+        // minimum is an economic parameter, so it moves through the timelock.
+        let action = vault.propose_set_min_deposit_amounts(&admin, &10, &0);
+        env.ledger().set_timestamp(DEFAULT_TIMELOCK_DELAY + 1);
+        vault.execute_pending_action(&admin, &action);
         let err = vault.try_deposit(&user, &5, &0, &0).unwrap_err().unwrap();
         assert_eq!(err, VaultError::AmountBelowMinimum.into());
     }
@@ -1843,8 +1846,11 @@ mod tests {
             .unwrap();
         assert_eq!(err, VaultError::InsufficientShares.into());
 
-        // Min shares below the configured withdrawal minimum.
-        vault.set_min_withdraw_shares(&admin, &100);
+        // Min shares below the configured withdrawal minimum; same timelock
+        // path as every other economic parameter.
+        let action = vault.propose_set_min_withdraw_shares(&admin, &100);
+        env.ledger().set_timestamp(DEFAULT_TIMELOCK_DELAY + 1);
+        vault.execute_pending_action(&admin, &action);
         let err = vault.try_withdraw(&user, &50, &0, &0).unwrap_err().unwrap();
         assert_eq!(err, VaultError::WithdrawalBelowMinimum.into());
     }
@@ -1857,7 +1863,7 @@ mod tests {
 
         let stranger = Address::generate(&env);
         let err = vault
-            .try_set_min_deposit_amounts(&stranger, &10, &10)
+            .try_propose_set_min_deposit_amounts(&stranger, &10, &10)
             .unwrap_err()
             .unwrap();
         assert_eq!(err, VaultError::Unauthorized.into());
