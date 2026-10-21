@@ -846,8 +846,6 @@ impl RebalanceEngine {
     fn require_not_paused(env: &Env) {
         if Self::is_paused(env.clone()) {
             env.panic_with_error(RebalanceError::Paused);
-        if Self::paused(env.clone()) {
-            panic!("rebalance engine is paused");
         }
     }
 
@@ -1622,6 +1620,13 @@ mod tests {
 
     #[test]
     fn test_get_strategy_unknown_id_is_typed() {
+        let env = Env::default();
+        let (client, _admin) = engine(&env);
+
+        let err = client.try_get_strategy(&7).unwrap_err().unwrap();
+        assert_eq!(err, RebalanceError::StrategyNotFound.into());
+    }
+
     // ============ CIRCUIT BREAKER TESTS (Issue #303) ============
 
     /// The breaker rule is a pure function: no engine, no storage, no ledger.
@@ -1657,8 +1662,9 @@ mod tests {
         env.mock_all_auths_allowing_non_root_auth();
         let (client, _admin) = engine(&env);
 
-        let err = client.try_get_strategy(&7).unwrap_err().unwrap();
-        assert_eq!(err, RebalanceError::StrategyNotFound.into());
+        assert!(!client.is_emergency_stop_triggered());
+        assert!(!client.check_emergency_stop());
+        assert!(!client.is_paused(), "a new engine must not stop itself");
     }
 
     #[test]
@@ -1684,9 +1690,6 @@ mod tests {
             .unwrap_err()
             .unwrap();
         assert_eq!(err, RebalanceError::ApyOutOfRange.into());
-        assert!(!client.is_emergency_stop_triggered());
-        assert!(!client.check_emergency_stop());
-        assert!(!client.is_paused(), "a new engine must not stop itself");
     }
 
     #[test]
