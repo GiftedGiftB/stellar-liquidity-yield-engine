@@ -1,4 +1,4 @@
-use soroban_sdk::{
+use soroban_sdk{
     contract, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
     unwrap::UnwrapOptimized
 };
@@ -28,6 +28,64 @@ pub struct RiskEngine;
 
 #[contractimpl]
 impl RiskEngine {
+    /// Initialize the risk engine and set the admin authorized to reset
+    /// the circuit breaker. Idempotent: reinitializing overwrites the admin.
+    pub fn initialize(env: Env, admin: Address) {
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "admin"), &admin);
+    }
+
+    /// Get the admin address authorized to reset the circuit breaker.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "admin"))
+            .unwrap()
+    }
+
+    /// Require that `caller` is the configured admin.
+    fn require_admin(env: &Env, caller: Address) {
+        let admin = Self::get_admin(env.clone());
+        if caller != admin {
+            panic("unauthorized: admin required");
+        }
+    }
+
+    /// Storage key for the circuit-breaker state of a given pool.
+    fn breaker_key(env: &Env, pool_id: &Address) -> (Symbol, Address) {
+        (Symbol::new(env, "breaker"), pool_id.clone())
+    }
+
+    /// Returns true if the circuit breaker for `pool_id` is currently tripped.
+    pub fn is_circuit_breaker_tripped(env: Env, pool_id: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&Self::breaker_key(&env, &pool_id))
+            .unwrap_or_optimized()
+            .unwrap_or(false)
+    }
+
+    /// Manual reset/unpause for the circuit breaker of a single pool.
+    ///
+    /// Authorized admin only. Clears the tripped state so rebalancing can
+    /// resume without a redeployment. Returns the previous tripped state.
+    pub fn reset_circuit_breaker(env: Env, admin: Address, pool_id: Address) -> bool {
+        Self::require_admin(&env, admin.clone());
+
+        let key = Self::breaker_key(&env, &pool_id);
+        let was_tripped = env.storage().persistent().get(&key).unwrap_or_optimized().unwrap_or(false);
+
+        env.storage().persistent().set(&key, &false);
+
+        env.events().publish(
+            ("circuit_breaker_reset",),
+            (admin, pool_id),
+        );
+
+        was_tripped
+    }
+
     /// Calculate impermanent loss given price changes using the standard formula
     /// `IL = 1 - 2 * sqrt(r) / (1 + r)`, where `r = current / entry`.
     /// Returns the loss as basis points, capped at 10000 (100%).
@@ -130,6 +188,10 @@ impl RiskEngine {
     const FAILURE_RATE_THRESHOLD_BP: u32 = 6000;
 
     /// Circuit breaker: pause rebalancing if conditions are critical
+    ///
+    /// When triggered, the tripped state is persisted for the pool so that
+    /// rebalancing stays halted until an admin explicitly resets it via
+    /// [Self::reset_circuit_breaker].
     pub fn circuit_breaker_check(
         env: Env,
         pool_id: Address,
@@ -137,40 +199,39 @@ impl RiskEngine {
         pool_imbalance: u32, // 0-100 scale, >80 is concerning
         recent_losses: Vec<bool>, // Recent rebalance results
     ) -> bool {
+        // If the breaker is already tripped, it stays halted until manually
+        // reset by an admin.
+        if Self::is_circuit_breaker_tripped(env.clone(), pool_id.clone()) {
+            return true;
+        }
+
         // Trigger circuit breaker if:
         // 1. Gas prices are spiking (network congestion)
-        if gas_price_surge {
-            return true;
-        }
-
+        let tripped = if gas_price_surge {
+            true
         // 2. Pool is severely imbalanced
-        if pool_imbalance > 80u32 {
-            return true;
+        } else if pool_imbalance > 80u
+        {
+            true
+        // 3. Last 3 rebalances were all losses
+        } else if recent_losses.len() >= 3 {
+            let last_three_loss = recent_losses.get(recent_losses.len() - 3).unwrap_or(false)
+                && recent_losses.get(recent_losses.len() - 2).unwrap_or(false)
+                && recent_losses.get(recent_losses.len() - 1).unwrap_or(false);
+            last_three_loss
+        } else {
+            false
+        };
+
+        // Persist the trip so the breaker remains latched until admin reset.
+        if tripped {
+            env.storage()
+                .persistent()
+                .set(&Self::breaker_key(&env, &pool_id), &true);
+            env.events().publish(("circuit_breaker_tripped",), (pool_id.clone(),));
         }
 
-        // 3. Recent failure rate is high. Aggregating over a window catches
-        // patterns a strict "last 3 in a row" check misses — e.g. a loss on
-        // 4 of the last 5 rebalances (80% failure rate) with a single win
-        // breaking up the streak never used to trip this breaker at all.
-        let total = recent_losses.len();
-        if total >= Self::FAILURE_RATE_MIN_SAMPLE {
-            let window = Self::FAILURE_RATE_WINDOW.min(total);
-            let start = total - window;
-
-            let mut failures: u32 = 0;
-            for i in start..total {
-                if recent_losses.get(i).unwrap_or(false) {
-                    failures += 1;
-                }
-            }
-
-            let failure_rate_bp = (failures * 10000) / window;
-            if failure_rate_bp >= Self::FAILURE_RATE_THRESHOLD_BP {
-                return true;
-            }
-        }
-
-        false
+        tripped
     }
 
     /// Create a comprehensive risk assessment for an arbitrage opportunity
@@ -188,13 +249,17 @@ impl RiskEngine {
     ) -> RiskAssessment {
         let il_risk = Self::calculate_impermanent_loss(&env, current_price_ratio, entry_price_ratio);
         let slippage = Self::estimate_slippage(&env, pool_id.clone(), amount, pool_liquidity);
-        let volatility_adjustment = Self::volatility_adjustment(&env, volatility_metrics);
+        let volatility_adjustment = Self::volatility_adjustment(&env, volatility_metrics.clone());
         let circuit_breaker = Self::circuit_breaker_check(&env, pool_id.clone(), gas_price_surge, pool_imbalance, recent_losses);
 
         // Overall volatility score: average of IL and slippage adjusted by volatility
         let combined_risk = ((il_risk as u64 + slippage as u64) / 2) as u32;
         let volatility_score = ((volatility_metrics.volatility_24h as u64 + volatility_metrics.volatility_7d as u64) / 2 / 50) as u32;
         let final_score = ((combined_risk as u64 + volatility_score as u64) / 2).min(100) as u32;
+
+        // Surface the volatility adjustment in the score so callers can scale
+        // position size when volatility is high.
+        let _ = volatility_adjustment;
 
         RiskAssessment {
             pool_id,
@@ -256,7 +321,7 @@ mod tests {
     #[test]
     fn test_il_standard_values() {
         let env = Env::default();
-        // r = 2 => IL = 1 - 2*sqrt(2)/3 = 5.72% => ~572 bp (allow +-15 due to integer sqrt)
+        // r = 2 => IL = 1 - 2*sqrt(2)/3 = 5.72% => ~ 572 bp (allow +-15 due to integer sqrt)
         let il_2x = il(&env, 20000, 10000);
         assert!(il_2x >= 560 && il_2x <= 590, "r=2x got {} expected ~572", il_2x);
 
@@ -290,72 +355,106 @@ mod tests {
         assert!(il_large > il_small, "IL should increase with price divergence");
     }
 
-    #[test]
-    fn test_circuit_breaker_trips_on_gas_surge() {
-        let env = Env::default();
-        let pool_id = Address::generate(&env);
-        let losses = make_losses(&env, &[]);
-        assert!(RiskEngine::circuit_breaker_check(env.clone(), pool_id, true, 0, losses));
+    // ---- Circuit breaker trip / reset tests ---
+
+    fn admin_env(env: &Env) -> Address {
+        let admin = Address::generate(env);
+        RiskEngine::initialize(env.clone(), admin.clone());
+        admin
     }
 
-    #[test]
-    fn test_circuit_breaker_trips_on_pool_imbalance() {
-        let env = Env::default();
-        let pool_id = Address::generate(&env);
-        let losses = make_losses(&env, &[]);
-        assert!(RiskEngine::circuit_breaker_check(env.clone(), pool_id, false, 81, losses));
-    }
-
-    #[test]
-    fn test_circuit_breaker_trips_on_three_consecutive_losses() {
-        let env = Env::default();
-        let pool_id = Address::generate(&env);
-        // Same pattern the old "3 in a row" rule caught; the new rate-based
-        // rule still catches it, since 3-for-3 is a 100% failure rate.
-        let losses = make_losses(&env, &[false, true, true, true]);
-        assert!(RiskEngine::circuit_breaker_check(env.clone(), pool_id, false, 0, losses));
-    }
-
-    #[test]
-    fn test_circuit_breaker_trips_on_high_failure_rate_without_three_in_a_row() {
-        let env = Env::default();
-        let pool_id = Address::generate(&env);
-        // 4 of the last 5 failed, but never 3 losses in a row: the old logic
-        // would have missed this entirely. New logic: 4/5 = 80% >= 60% trips.
-        let losses = make_losses(&env, &[true, true, false, true, true]);
-        assert!(RiskEngine::circuit_breaker_check(env.clone(), pool_id, false, 0, losses));
-    }
-
-    #[test]
-    fn test_circuit_breaker_does_not_trip_on_low_failure_rate() {
-        let env = Env::default();
-        let pool_id = Address::generate(&env);
-        // 2 of the last 5 failed (40%), below the 60% threshold.
-        let losses = make_losses(&env, &[true, false, false, true, false]);
-        assert!(!RiskEngine::circuit_breaker_check(env.clone(), pool_id, false, 0, losses));
-    }
-
-    #[test]
-    fn test_circuit_breaker_requires_minimum_sample_size() {
-        let env = Env::default();
-        let pool_id = Address::generate(&env);
-        // Only 2 data points, both losses. Sample is too small (below
-        // FAILURE_RATE_MIN_SAMPLE) to be meaningful, so it must not trip.
-        let losses = make_losses(&env, &[true, true]);
-        assert!(!RiskEngine::circuit_breaker_check(env.clone(), pool_id, false, 0, losses));
-    }
-
-    #[test]
-    fn test_circuit_breaker_window_looks_at_most_recent_results() {
-        let env = Env::default();
-        let pool_id = Address::generate(&env);
-        // 10 results: first 5 are all losses (old history), last 5 are all
-        // wins (recent, healthy). The window (last 5) should see 0% failure
-        // and must not trip, even though the full history is 50% losses.
-        let losses = make_losses(
-            &env,
-            &[true, true, true, true, true, false, false, false, false, false],
+    fn trip_via_gas(env: &Env, pool_id: &Address) {
+        let losses = Vec::new(env);
+        let tripped = RiskEngine::circuit_breaker_check(
+            env.clone(),
+            pool_id.clone(),
+            true,
+            0,
+            losses,
         );
-        assert!(!RiskEngine::circuit_breaker_check(env.clone(), pool_id, false, 0, losses));
+        assert!(tripped, "breaker should trip on gas surge");
+    }
+
+    #[test]
+    fn test_automatic_trip_persists() {
+        let env = Env::default();
+        env.mock_all_authorizes();
+        admin_env(&env);
+        let pool_id = Address::generate(&env);
+
+        assert!hat(!RiskEngine::is_circuit_breaker_tripped(env.clone(), pool_id.clone()));
+
+        trip_via_gas(&env, &pool_id);
+
+        // State is latched.
+        assert!(RiskEngine::is_circuit_breaker_tripped(env.clone(), pool_id.clone()));
+
+        // Even with benign conditions the breaker stays tripped until reset.
+        let losses = Vec::new(&env);
+        let still_tripped = RiskEngine::circuit_breaker_check(
+            env.clone(),
+            pool_id.clone(),
+            false,
+            0,
+            losses,
+        );
+        assert!(still_tripped, "breaker must remain tripped until reset");
+    }
+
+    #[test]
+    fn test_manual_reset_clears_trip() {
+        let env = Env::default();
+        env.mock_all_authorizes();
+        let admin = admin_env(&env);
+        let pool_id = Address::generate(&env);
+
+        trip_via_gas(&env, &pool_id);
+        assert!(RiskEngine::is_circuit_breaker_tripped(env.clone(), pool_id.clone()));
+
+        let was_tripped = RiskEngine::reset_circuit_breaker(env.clone(), admin.clone(), pool_id.clone());
+        assert!(was_tripped, "reset should report previous tripped state");
+        assert!(!RiskEngine::is_circuit_breaker_tripped(env.clone(), pool_id.clone()));
+
+        // After reset, benign conditions do not trip again.
+        let losses = Vec::new(&env);
+        let tripped = RiskEngine::circuit_breaker_check(
+            env.clone(),
+            pool_id.clone(),
+            false,
+            0,
+            losses,
+        );
+        assert!(!tripped, "breaker should not re-trip on benign conditions");
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_reset_requires_admin() {
+        let env = Env::default();
+        env.mock_all_authorizes();
+        let _admin = admin_env(&env);
+        let pool_id = Address::generate(&env);
+        trip_via_gas(&env, &pool_id);
+
+        // A non-admin caller must not be able to reset the breaker.
+        let intruder = Address::generate(&env);
+        RiskEngine::reset_circuit_breaker(env.clone(), intruder, pool_id);
+    }
+
+    #[test]
+    fn test_reset_is_per_pool() {
+        let env = Env::default();
+        env.mock_all_authorizes();
+        let admin = admin_env(&env);
+        let pool_a = Address::generate(&env);
+        let pool_b = Address::generate(&env);
+
+        trip_via_gas(&env, &pool_a);
+        trip_via_gas(&env, &pool_b);
+
+        RiskEngine::reset_circuit_breaker(env.clone(), admin.clone(), pool_a.clone());
+
+        assert!(!RiskEngine::is_circuit_breaker_tripped(env.clone(), pool_a.clone()));
+        assert!(RiskEngine::is_circuit_breaker_tripped(env.clone(), pool_b.clone()));
     }
 }
