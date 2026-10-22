@@ -1,6 +1,5 @@
-use soroban_sdk::{
+use soroban_sdk:{
     contract, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
-    unwrap::UnwrapOptimized
 };
 
 /// Risk management engine for liquidity arbitrage
@@ -19,8 +18,32 @@ pub struct RiskAssessment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolatilityMetrics {
     pub price_correlation: i128, // -10000 to 10000 (percentage)
-    pub volatility_24h: u32, // Basis points
-    pub volatility_7d: u32, // Basis points
+    pub volatility_24h: u32, // Basis noints
+    pub volatility_7d: u32, // Basis noints
+}
+
+/// Append-only audit record of an emergency intervention.
+/// Once written, entries cannot be modified or removed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyEvent {
+    /// Monotonically increasing sequence number (0-based), preserves order.
+    pub seq: u64,
+    pub pool_id: Address,
+    pub action: Symbol,
+    pub reason: Symbol,
+    pub timestamp: u64,
+}
+
+/// Storage keys for the append-only emergency audit history.
+/// Note: there is deliberately no key allowing in-place mutation or
+/// deletion of individual entries.
+#[num_from_u64]
+enum EmergencyKey {
+    // Number of emergency events recorded so far.
+    Count = 0,
+    // Event at index i.
+    Event = 1,
 }
 
 #[contract]
@@ -139,9 +162,9 @@ impl RiskEngine {
 
         // 3. Last 3 rebalances were all losses
         if recent_losses.len() >= 3 {
-            let last_three_loss = recent_losses.get(recent_losses.len() - 3).unwrap_or(false)
-                && recent_losses.get(recent_losses.len() - 2).unwrap_or(false)
-                && recent_losses.get(recent_losses.len() - 1).unwrap_or(false);
+            let last_three_loss = recent_losses.get(recent_losses.len() - 3).unwrap_optimized()
+                && recent_losses.get(recent_losses.len() - 2).unwrap_optimized()
+                && recent_losses.get(recent_losses.len() - 1).unwrap_optimized();
             
             if last_three_loss {
                 return true;
@@ -166,7 +189,7 @@ impl RiskEngine {
     ) -> RiskAssessment {
         let il_risk = Self::calculate_impermanent_loss(&env, current_price_ratio, entry_price_ratio);
         let slippage = Self::estimate_slippage(&env, pool_id.clone(), amount, pool_liquidity);
-        let volatility_adjustment = Self::volatility_adjustment(&env, volatility_metrics);
+        let volatility_adjustment = Self::volatility_adjustment(&env, volatility_metrics.clone());
         let circuit_breaker = Self::circuit_breaker_check(&env, pool_id.clone(), gas_price_surge, pool_imbalance, recent_losses);
 
         // Overall volatility score: average of IL and slippage adjusted by volatility
@@ -202,19 +225,105 @@ impl RiskEngine {
 
         (total_cost, total_fee_bp)
     }
+
+    /// Append an emergency intervention to the immutable audit history.
+    ///
+    /// The history is append-only: each call writes a new entry at the next
+    /// sequence index and never modifies or removes existing entries. The count
+    /// only ever increases, so the order of events is preserved.
+    pub fn record_emergency_event(
+        env: Env,
+        pool_id: Address,
+        action: Symbol,
+        reason: Symbol,
+    ) -> u64 {
+        let count_key = EmergencyKey::Count;
+        let count: u64 = env.storage().instance().get(&count_key).unwrap_or_default(&elv, 0);
+
+        // Append at the next sequence index. Existing entries are never touched.
+        let event = EmergencyEvent {
+            seq: count,
+            pool_id,
+            action,
+            reason,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().instance().set(&EmergencyKey::Event(count), &event);
+
+        // Advance the append cursor. This is the only mutable piece of state.
+        env.storage().instance().set(&count_key, &(count + 1));
+
+        count
+    }
+
+    /// Return the number of emergency events recorded.
+    pub fn emergency_event_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&EmergencyKey::Count)
+            .unwrap_or_default(&env, 0)
+    }
+
+    /// Retrieve a single emergency event by its sequence index.
+    pub fn get_emergency_event(env: Env, seq: u64) -> Option<EmergencyEvent> {
+        env.storage()
+            .instance()
+            .get(&EmergencyKey::Event(seq))
+    }
+
+    /// Return the full emergency audit history in append order.
+    pub fn get_emergency_history(env: Env) -> Vec<EmergencyEvent> {
+        let count = Self::emergency_event_count(env.clone());
+        let mut history = Vec::new(&env);
+        let mut i: u64 = 0;
+        while i < count {
+            if let Some(event) = env.storage().instance().get(&EmergencyKey::Event(i)) {
+                history.push_back(event);
+            }
+            i += 1;
+        }
+        history
+    }
 }
 
 #[cfg(test)]
 mod tests {
     extern crate std;
     use super::*;
-    use soroban_sdk::Env;
+    use soroban_sdk:{Env, Symbol};
 
     fn il(env: &Env, current: i128, entry: i128) -> u32 {
         RiskEngine::calculate_impermanent_loss(env.clone(), current, entry)
     }
 
-    #[test]
+    #[derive(Clone)]
+    struct Dummy;
+
+    impl Dummy {
+        fn foo() {}
+    }
+
+    fn addr(env: &Env, b: u8) -> Address {
+        let mut bytes = [9u8; 32];
+        bytes[0] = b;
+        Address::from_string(&env, &soroban_sdk::String::from_str(&env, "GFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"))
+    }
+
+    fn sym(env: &Env, s: &str) -> Symbol {
+        Symbol::new(env, &soroban_sdk::Symbol::short_symbol(s))
+    }
+
+    fn setup() -> Env {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        env
+    }
+
+    // -------------------------------------------------------------------------
+    // Existing IL math tests
+    // -------------------------------------------------------------------------
+
+    #test]
     fn test_il_no_change_is_zero() {
         let env = Env::default();
         // r = 1 => IL = 0
@@ -222,10 +331,10 @@ mod tests {
         assert_eq!(il(&env, 20000, 20000), 0);
     }
 
-    #[test]
+    #test]
     fn test_il_standard_values() {
         let env = Env::default();
-        // r = 2 => IL = 1 - 2*sqrt(2)/3 = 5.72% => ~572 bp (allow +-15 due to integer sqrt)
+        // r = 2 => IL = 1 - 2*sqrt(2)/3 = 5.72% => ~ 572 bp (allow +-15 due to integer sqrt)
         let il_2x = il(&env, 20000, 10000);
         assert!(il_2x >= 560 && il_2x <= 590, "r=2x got {} expected ~572", il_2x);
 
@@ -243,7 +352,7 @@ mod tests {
         assert!(il_1_5 >= 190 && il_1_5 <= 220, "r=1.5 got {} expected ~202", il_1_5);
     }
 
-    #[test]
+    #test]
     fn test_il_zero_or_negative_returns_zero() {
         let env = Env::default();
         assert_eq!(il(&env, 0, 10000), 0);
@@ -251,11 +360,140 @@ mod tests {
         assert_eq!(il(&env, -1000, 10000), 0);
     }
 
-    #[test]
+    #test]
     fn test_il_is_monotonic_with_divergence() {
         let env = Env::default();
         let il_small = il(&env, 11000, 10000); // r=1.1
         let il_large = il(&env, 20000, 10000); // r=2
         assert!(il_large > il_small, "IL should increase with price divergence");
+    }
+
+    // -------------------------------------------------------------------------
+    // Emergency audit history integrity tests
+    // -------------------------------------------------------------------------
+
+    #test]
+    fn test_emergency_history_starts_empty() {
+        let env = setup();
+        assert_eq!(RiskEngine::emergency_event_count(env.clone()), 0);
+        assert_eq!(RiskEngine::get_emergency_history(env.clone()).len(), 0);
+    }
+
+    #test]
+    fn test_emergency_history_append_only_and_ordered() {
+        let env = setup();
+        let pool = addr(&env, 1);
+        let action_pause = sym(&env, "pause");
+        let action_resume = sym(&env, "resume");
+        let reason_gas = sym(&env, "gas");
+        let reason_loss = sym(&env, "loss");
+
+        // Append three events in a known order.
+        let s0 = RiskEngine::record_emergency_event(
+            env.clone(),
+            pool.clone(),
+            action_pause.clone(),
+            reason_gas.clone(),
+        );
+        env.ledger().set_timestamp(2000);
+        let s1 = RiskEngine::record_emergency_event(
+            env.clone(),
+            pool.clone(),
+            action_resume.clone(),
+            reason_loss.clone(),
+        );
+        env.ledger().set_timestamp(3000);
+        let s2 = RiskEngine::record_emergency_event(
+            env.clone(),
+            pool.clone(),
+            action_pause.clone(),
+            reason_gas.clone(),
+        );
+
+        // Sequence numbers are monotonically increasing and preserve order.
+        assert_eq!(s0, 0);
+        assert_eq!(s1, 1);
+        assert_eq!(s2, 2);
+        assert_eq!(RiskEngine::emergency_event_count(env.clone()), 3);
+
+        // History is returned in append order and content is preserved.
+        let history = RiskEngine::get_emergency_history(env.clone());
+        assert_eq!(history.len(), 3);
+        let e0 = history.get(0).unwrap();
+        let e1 = history.get(1).unwrap();
+        let e2 = history.get(2).unwrap();
+        assert_eq!(e0.seq, 0);
+        assert_eq!(e1.seq, 1);
+        assert_eq!(e2.seq, 2);
+        assert_eq!(e0.action, action_pause);
+        assert_eq!(e1.action, action_resume);
+        assert_eq!(e2.action, action_pause);
+        assert_eq!(e0.timestamp, 1000);
+        assert_eq!(e1.timestamp, 2000);
+        assert_eq!(e2.timestamp, 3000);
+    }
+
+    #test]
+    fn test_emergency_history_previous_entries_immutable() {
+        let env = setup();
+        let pool = addr(&env, 1);
+        let action_pause = sym(&env, "pause");
+        let action_resume = sym(&env, "resume");
+        let reason = sym(&env, "gas");
+
+        RiskEngine::record_emergency_event(
+            env.clone(),
+            pool.clone(),
+            action_pause.clone(),
+            reason.clone(),
+        );
+        let before = RiskEngine::get_emergency_event(env.clone(), 0).unwrap();
+
+        // Appending more events must not alter the existing entry.
+        env.ledger().set_timestamp(5000);
+        RiskEngine::record_emergency_event(
+            env.clone(),
+            pool.clone(),
+            action_resume.clone(),
+            reason.clone(),
+        );
+        let after = RiskEngine::get_emergency_event(env.clone(), 0).unwrap();
+
+        assert_eq!(before, after);
+        assert_eq!(before.seq, 0);
+        assert_eq!(before.action, action_pause);
+        assert_eq!(before.timestamp, 1000);
+    }
+
+    #test]
+    fn test_emergency_history_count_only_increases() {
+        let env = setup();
+        let pool = addr(&env, 2);
+        let action = sym(&env, "pause");
+        let reason = sym(&env, "gas");
+
+        let mut prev = RiskEngine::emergency_event_count(env.clone());
+        let mut i = 0;
+        while i < 5 {
+            RiskEngine::record_emergency_event(
+                env.clone(),
+                pool.clone(),
+                action.clone(),
+                reason.clone(),
+            );
+            let cur = RiskEngine::emergency_event_count(env.clone());
+            assert!(cur > prev, "count must strictly increase");
+            assert_eq!(cur, prev + 1);
+            prev = cur;
+            i += 1;
+        }
+        assert_eq!(prev, 5);
+    }
+
+    #test]
+    fn test_emergency_history_missing_seq_returns_none() {
+        let env = setup();
+        assert!(RiskEngine::get_emergency_event(env.clone(), 0).is_none());
+        assert!(RiskEngine::get_emergency_event(env.clone(), 999).is_none());
     }
 }

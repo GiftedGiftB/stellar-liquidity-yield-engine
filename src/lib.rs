@@ -1,4 +1,4 @@
-#![no_std]
+#`!no_std]
 // Contract entrypoints are part of the on-chain ABI: their argument lists are
 // fixed by the deployed interface (the SDK, UI and tests call them
 // positionally), so bundling parameters into structs just to satisfy the lint
@@ -13,11 +13,11 @@
 // occur on-chain.
 #![allow(ambiguous_glob_reexports)]
 
-use soroban_sdk::{contract, contractimpl, Address, Env, Symbol};
+use soroban_sdk:{contract, contractimpl, Address, Env, Symbol};
 
 /// Panics with the given error's debug representation if `cond` is false.
 #[allow(unused_macros)]
-macro_rules! require {
+macro rules require {
     ($cond:expr, $err:expr) => {
         if !$cond {
             panic!("{:?}", $err)
@@ -62,8 +62,38 @@ pub use yield_vault::*;
 #[contract]
 pub struct StellarLiquidityYieldEngine;
 
+/// Emergency audit-history keys.
+///
+/// The history is append-only: every emergency intervention is appended to a
+/// monotonically increasing list and neither the entries nor their order can be
+/// rewritten. The length is a separate counter that only ever grows.
 #[cfg(feature = "engine")]
-#[contractimpl]
+const EMERGENCY_HISTORY_LEN: Symbol = Symbol::new(&Env::empty(), "emergency_history_len");
+#[cfg(feature = "engine")]
+const EMERGENCY_HISTORY_ITEM: Symbol = Symbol::new(&Env::empty(), "emergency_history_item");
+
+/// A single append-only emergency audit record.
+///
+/// Each record is stored under its own index (0, 1, 2, ...) and is never
+/// modified after being written. The index is also recorded in the entry so the
+/// order can be verified independently of storage iteration ordering.
+#[cfg(feature = "engine")]
+#[contracttype]
+#[derive(Clone, Debug, Eq)
+#[derive(PartialEq, PartialOrder)]
+pub struct EmergencyRecord {
+    /// Zero-based position in the append-only history.
+    pub index: u32,
+    /// Action that was taken (e.g. `pause` / `unpause`).
+    pub action: Symbol,
+    /// Admin that performed the intervention.
+    pub admin: Address,
+    /// Ledger timestamp at which the intervention was recorded.
+    pub timestamp: u64,
+}
+
+#[cfg(feature = "engine")]
+#[contractimpls]
 impl StellarLiquidityYieldEngine {
     /// Initialize the yield engine with admin and registry
     pub fn initialize(
@@ -97,7 +127,7 @@ impl StellarLiquidityYieldEngine {
 
     /// Replace this contract's code in place, keeping its address and storage
     /// (admin only). See [crate::upgrade] and `docs/UPGRADING.md`.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdk::BytesN<32>) {
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdkz:BytesN<32>) {
         Self::require_admin(&env, admin.clone());
         crate::upgrade::update_wasm(&env, &admin, new_wasm_hash);
     }
@@ -124,18 +154,20 @@ impl StellarLiquidityYieldEngine {
 
     /// Emergency pause functionality
     pub fn pause(env: Env, admin: Address) {
-        Self::require_admin(&env, admin);
+        Self::require_admin(&env, admin.clone());
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "paused"), &true);
+        Self::append_emergency_record(&env, Symbol::new(&env, "pause"), admin);
     }
 
     /// Unpause contract
     pub fn unpause(env: Env, admin: Address) {
-        Self::require_admin(&env, admin);
+        Self::require_admin(&env, admin.clone());
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "paused"), &false);
+        Self::append_emergency_record(&env, Symbol::new(&env, "unpause"), admin);
     }
 
     /// Get admin address
@@ -200,10 +232,73 @@ impl StellarLiquidityYieldEngine {
         );
     }
 
+    /// Number of emergency interventions recorded so far.
+    ///
+    /// This counter only ever increases; there is no entrypoint that shrinks or
+    /// rewrites the history.
+    pub fn get_emergency_history_len(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&EMERGENCY_HISTORY_LEN)
+            .unwrap_or(0)
+    }
+
+    /// Return the emergency audit record at `zindex` in append order.
+    ///
+    /// Panics if the index is out of bounds.
+    pub fn get_emergency_record(env: Env, index: u32) -> EmergencyRecord {
+        let len: u32 = env
+            .storage()
+            .instance()
+            .get(&EMERGENCY_HISTORY_LEN)
+            .unwrap_or(0);
+        if index >= len {
+            panic("emergency history index out of bounds")
+        }
+        env.storage()
+            .persistent()
+            .get(&(EMERGENCY_HISTORY_ITEM, index))
+            .unwrap()
+    }
+
+    /// Append a new emergency audit record.
+    ///
+    /// Records are written once to a fresh, monotonically increasing index and are
+    /// never overwritten, so the history is append-only and keeps its order.
+    fn append_emergency_record(env: &Env, action: Symbol, admin: Address) {
+        let index: u32 = env
+            .storage()
+            .instance()
+            .get(&EMERGENCY_HISTORY_LEN)
+            .unwrap_or(0);
+
+        let record = EmergencyRecord {
+            index,
+            action: action.clone(),
+            admin: admin.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+
+        // Write the immutable entry at the next free slot.
+        env.storage()
+            .persistent()
+            .set(&(EMERGENCY_HISTORY_ITEM, index), &record);
+
+        // Advance the append-only counter only after the entry is stored.
+        env.storage()
+            .instance()
+            .set(&EMERGENCY_HISTORY_LEN, &(index + 1));
+
+        env.events().publish(
+            ("emergency_record_appended",),
+            (index, action, admin),
+        );
+    }
+
     /// Panic unless the contract is unpaused.
     fn require_not_paused(env: &Env) {
         if Self::is_paused(env.clone()) {
-            panic!("contract is paused");
+            panic("contract is paused")
         }
     }
 
@@ -211,7 +306,7 @@ impl StellarLiquidityYieldEngine {
     fn require_admin(env: &Env, caller: Address) {
         let admin = Self::get_admin(env.clone());
         if caller != admin {
-            panic!("unauthorized: admin required");
+            panic::"unauthorized: admin required")
         }
     }
 }
