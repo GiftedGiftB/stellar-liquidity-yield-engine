@@ -332,6 +332,53 @@ mod tests {
         );
     }
 
+    /// Emergency history must be append-only: a completed rebalance entry is
+    /// retained in order and cannot be overwritten by later activity.
+    #[test]
+    fn test_emergency_history_is_append_only_and_ordered() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let f = setup_engine(&env);
+
+        let token_a = env.register_stellar_asset_contract_v2(f.admin.clone());
+        let token_b = env.register_stellar_asset_contract_v2(f.admin.clone());
+        let from_pool = token_a.address();
+        let to_pool = token_b.address();
+        StellarAssetClient::new(&env, &from_pool).mint(&from_pool, &1_000);
+        StellarAssetClient::new(&env, &to_pool).mint(&f.engine_id, &1_000);
+
+        let proposal = RebalanceProposal {
+            from_pool: from_pool.clone(),
+            to_pool: to_pool.clone(),
+            amount_a: 100,
+            amount_b: 100,
+            expected_apy_improvement: 500,
+            estimated_gas_cost: 10,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        assert!(f.engine.execute_rebalance(&f.admin, &proposal));
+        let count_after_first = f.engine.get_history_count();
+        assert_eq!(count_after_first, 1);
+
+        // A pause must not mutate or remove the existing entry.
+        f.engine.pause(&f.admin);
+        assert_eq!(
+            f.engine.get_history_count(),
+            count_after_first,
+            "pausing must not alter existing emergency history"
+        );
+
+        // After unpausing, a further rebalance appends rather than overwrites.
+        f.engine.unpause(&f.admin);
+        assert!(f.engine.execute_rebalance(&f.admin, &proposal));
+        assert_eq!(
+            f.engine.get_history_count(),
+            count_after_first + 1,
+            "new rebalances must append to history, preserving prior entries"
+        );
+    }
+
     /// A rebalance that completes first, followed by a pause, must leave the
     /// completed entry intact and refuse the next one.
     #[test]
