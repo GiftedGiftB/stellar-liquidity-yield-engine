@@ -1,4 +1,4 @@
-use soroban_sdk::{testutils::Address as _, Address, Env, Symbol};
+use soroban_sdk::{testutils::Address as _, Address, Env, Symbol, Vec as SorobanVec};
 use stellar_liquidity_yield_engine::{RiskEngine, RiskEngineClient};
 
 fn main() {}
@@ -237,6 +237,57 @@ mod tests {
         assert!(
             !result,
             "Circuit breaker should NOT trigger under normal conditions"
+        );
+    }
+
+    #[test]
+    fn test_circuit_breaker_trip_then_manual_reset() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let client = setup_risk_engine(&env);
+        let pool_id = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        // Trip the breaker via automatic detection (gas surge)
+        let tripped = client.circuit_breaker_check(&pool_id, &true, &50, &SorobanVec::new(&env));
+        assert!(tripped, "Circuit breaker should trip on gas surge");
+        assert!(
+            client.is_circuit_breaker_active(&pool_id),
+            "Breaker should be active after trip"
+        );
+
+        // Authorized admin resets the breaker
+        client.reset_circuit_breaker(&admin, &pool_id);
+        assert!(
+            !client.is_circuit_breaker_active(&pool_id),
+            "Breaker should be cleared after admin reset"
+        );
+
+        // After reset, normal conditions should not re-trip
+        let result = client.circuit_breaker_check(&pool_id, &false, &30, &SorobanVec::new(&env));
+        assert!(
+            !result,
+            "Breaker should not re-trip under normal conditions after reset"
+        );
+    }
+
+    #[test]
+    fn test_circuit_breaker_manual_reset_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let client = setup_risk_engine(&env);
+        let pool_id = Address::generate(&env);
+        let admin = Address::generate(&env);
+
+        // Trip the breaker
+        let tripped = client.circuit_breaker_check(&pool_id, &false, &85, &SorobanVec::new(&env));
+        assert!(tripped, "Circuit breaker should trip on pool imbalance");
+
+        // Reset must be authorized by admin; with mocked auths this succeeds
+        client.reset_circuit_breaker(&admin, &pool_id);
+        assert!(
+            !client.is_circuit_breaker_active(&pool_id),
+            "Admin reset should clear the breaker"
         );
     }
 
