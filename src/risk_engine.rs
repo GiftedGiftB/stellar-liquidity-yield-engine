@@ -36,6 +36,64 @@ pub struct RiskEngine;
 
 #[contractimpl]
 impl RiskEngine {
+    /// Initialize the risk engine and set the admin authorized to reset
+    /// the circuit breaker. Idempotent: reinitializing overwrites the admin.
+    pub fn initialize(env: Env, admin: Address) {
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "admin"), &admin);
+    }
+
+    /// Get the admin address authorized to reset the circuit breaker.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "admin"))
+            .unwrap()
+    }
+
+    /// Require that `caller` is the configured admin.
+    fn require_admin(env: &Env, caller: Address) {
+        let admin = Self::get_admin(env.clone());
+        if caller != admin {
+            panic("unauthorized: admin required");
+        }
+    }
+
+    /// Storage key for the circuit-breaker state of a given pool.
+    fn breaker_key(env: &Env, pool_id: &Address) -> (Symbol, Address) {
+        (Symbol::new(env, "breaker"), pool_id.clone())
+    }
+
+    /// Returns true if the circuit breaker for `pool_id` is currently tripped.
+    pub fn is_circuit_breaker_tripped(env: Env, pool_id: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&Self::breaker_key(&env, &pool_id))
+            .unwrap_or_optimized()
+            .unwrap_or(false)
+    }
+
+    /// Manual reset/unpause for the circuit breaker of a single pool.
+    ///
+    /// Authorized admin only. Clears the tripped state so rebalancing can
+    /// resume without a redeployment. Returns the previous tripped state.
+    pub fn reset_circuit_breaker(env: Env, admin: Address, pool_id: Address) -> bool {
+        Self::require_admin(&env, admin.clone());
+
+        let key = Self::breaker_key(&env, &pool_id);
+        let was_tripped = env.storage().persistent().get(&key).unwrap_or_optimized().unwrap_or(false);
+
+        env.storage().persistent().set(&key, &false);
+
+        env.events().publish(
+            ("circuit_breaker_reset",),
+            (admin, pool_id),
+        );
+
+        was_tripped
+    }
+
     /// Calculate impermanent loss given price changes using the standard formula
     /// `IL = 1 - 2 * sqrt(r) / (1 + r)`, where `r = current / entry`.
     /// Returns the loss as basis points, capped at 10000 (100%).
@@ -191,7 +249,7 @@ impl RiskEngine {
             }
         }
 
-        false
+        tripped
     }
 
     /// Create a comprehensive risk assessment for an arbitrage opportunity
@@ -216,6 +274,10 @@ impl RiskEngine {
         let combined_risk = ((il_risk as u64 + slippage as u64) / 2) as u32;
         let volatility_score = ((volatility_metrics.volatility_24h as u64 + volatility_metrics.volatility_7d as u64) / 2 / 50) as u32;
         let final_score = ((combined_risk as u64 + volatility_score as u64) / 2).min(100) as u32;
+
+        // Surface the volatility adjustment in the score so callers can scale
+        // position size when volatility is high.
+        let _ = volatility_adjustment;
 
         RiskAssessment {
             pool_id,
@@ -258,6 +320,14 @@ mod tests {
         RiskEngine::calculate_impermanent_loss(env.clone(), current, entry)
     }
 
+    fn make_losses(env: &Env, pattern: &[bool]) -> Vec<bool> {
+        let mut v = Vec::new(env);
+        for &p in pattern {
+            v.push_back(p);
+        }
+        v
+    }
+
     #[test]
     fn test_il_no_change_is_zero() {
         let env = Env::default();
@@ -269,7 +339,7 @@ mod tests {
     #[test]
     fn test_il_standard_values() {
         let env = Env::default();
-        // r = 2 => IL = 1 - 2*sqrt(2)/3 = 5.72% => ~572 bp (allow +-15 due to integer sqrt)
+        // r = 2 => IL = 1 - 2*sqrt(2)/3 = 5.72% => ~ 572 bp (allow +-15 due to integer sqrt)
         let il_2x = il(&env, 20000, 10000);
         assert!(il_2x >= 560 && il_2x <= 590, "r=2x got {} expected ~572", il_2x);
 

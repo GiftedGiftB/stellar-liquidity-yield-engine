@@ -1,4 +1,4 @@
-#![no_std]
+#`!no_std]
 // Contract entrypoints are part of the on-chain ABI: their argument lists are
 // fixed by the deployed interface (the SDK, UI and tests call them
 // positionally), so bundling parameters into structs just to satisfy the lint
@@ -13,11 +13,11 @@
 // occur on-chain.
 #![allow(ambiguous_glob_reexports)]
 
-use soroban_sdk::{contract, contractimpl, Address, Env, Symbol};
+use soroban_sdk:{contract, contractimpl, Address, Env, Symbol};
 
 /// Panics with the given error's debug representation if `cond` is false.
 #[allow(unused_macros)]
-macro_rules! require {
+macro rule require {
     ($cond:expr, $err:expr) => {
         if !$cond {
             panic!("{:?}", $err)
@@ -146,12 +146,51 @@ impl StellarLiquidityYieldEngine {
             .set(&Symbol::new(&env, "paused"), &false);
     }
 
+    /// Return true if the circuit breaker has tripped.
+    pub fn is_circuit_breaker_tripped(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "circuit_tripped"))
+            .unwrap_or(false)
+    }
+
+    /// Trip the circuit breaker and halt operations (admin only).
+    ///
+    /// This is the automatic-halt path: once tripped, operations are halted
+    /// until an admin explicitly resets the breaker.
+    pub fn trip_circuit_breaker(env: Env, admin: Address) {
+        Self::require_admin(&env, admin.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "circuit_tripped"), &true);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "paused"), &true);
+
+        env.events().publish(("circuit_breaker_tripped",), (admin,));
+    }
+
+    /// Manually reset the circuit breaker and unpause the contract (admin
+    /// only). This is the recovery path after an automatic halt, allowing the
+    /// system to resume without redeployment.
+    pub fn reset_circuit_breaker(env: Env, admin: Address) {
+        Self::require_admin(&env, admin.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "circuit_tripped"), &false);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "paused"), &false);
+
+        env.events().publish(("circuit_breaker_reset",), (admin,));
+    }
+
     /// Get admin address
     pub fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "admin"))
-            .unwrap()
+            .unwrap_or_else(|| panic!("admin not configured"))
     }
 
     /// Update admin
@@ -208,27 +247,19 @@ impl StellarLiquidityYieldEngine {
         );
     }
 
-    /// Panic unless the contract is unpaused.
-    ///
-    /// Safety checklist item P-1: every state-mutating entrypoint that is not
-    /// itself an emergency control (pause/unpause/upgrade/migrate) must call
-    /// this guard before touching storage. Verified by
-    /// `test_paused_blocks_state_mutations`.
+    /// Panic unless the contract is unpaused and the circuit breaker is not
+    /// tripped.
     fn require_not_paused(env: &Env) {
-        if Self::is_paused(env.clone()) {
-            panic!("contract is paused");
+        if Self::is_paused(env.clone()) || Self::is_circuit_breaker_tripped(env.clone()) {
+            panic!("contract is paused")
         }
     }
 
-    /// Require admin authorization.
-    ///
-    /// Safety checklist item A-1: privileged entrypoints must compare the
-    /// caller against the stored admin and panic otherwise. Verified by
-    /// `test_non_admin_cannot_pause` and `test_non_admin_cannot_update_admin`.
+    /// Require admin authorization
     fn require_admin(env: &Env, caller: Address) {
         let admin = Self::get_admin(env.clone());
         if caller != admin {
-            panic!("unauthorized: admin required");
+            panic!("unauthorized: admin required")
         }
     }
 }

@@ -630,7 +630,7 @@ impl StrategyRegistry {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "admin"))
-            .unwrap_optimized()
+            .unwrap_or_else(|| panic!("admin not configured"))
     }
 
     fn require_admin(env: &Env, caller: Address) {
@@ -690,6 +690,7 @@ mod tests {
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{Env, Symbol, TryFromVal, Vec};
     use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{Env, Symbol, TryFromVal, Vec};
 
     fn fee_structure() -> FeeStructure {
         FeeStructure {
@@ -1164,6 +1165,16 @@ mod tests {
         }));
         expect_panic(unpause_result);
         assert!(client.is_paused_view());
+    }
+
+    /// Topic of the only event published by the most recent invocation.
+    ///
+    /// `env.events().all()` only exposes the events of the latest contract
+    /// call, so each event has to be inspected before the next call is made.
+    fn last_event_topic(env: &Env) -> Symbol {
+        let events = env.events().all();
+        let (_contract, topics, _data) = events.last().unwrap();
+        Symbol::try_from_val(env, &topics.get(0).unwrap()).unwrap()
     }
 
     #[test]
