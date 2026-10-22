@@ -176,6 +176,17 @@ impl RiskEngine {
         adjustment
     }
 
+    /// Minimum number of recent results required before the failure-rate check
+    /// can trip the breaker. Below this, a sample is too small to be meaningful.
+    const FAILURE_RATE_MIN_SAMPLE: u32 = 3;
+    /// How many of the most recent rebalances are considered when computing
+    /// the recent failure rate (uses fewer if history is shorter than this).
+    const FAILURE_RATE_WINDOW: u32 = 5;
+    /// Trip the breaker once the recent failure rate reaches this many basis
+    /// points (6000 = 60%). Chosen so 3-for-3 (100%) still trips, same as the
+    /// previous "3 in a row" rule, but so does e.g. 3-for-5 (60%).
+    const FAILURE_RATE_THRESHOLD_BP: u32 = 6000;
+
     /// Circuit breaker: pause rebalancing if conditions are critical
     ///
     /// When triggered, the tripped state is persisted for the pool so that
@@ -284,10 +295,19 @@ impl RiskEngine {
 mod tests {
     extern crate std;
     use super::*;
+    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
 
     fn il(env: &Env, current: i128, entry: i128) -> u32 {
         RiskEngine::calculate_impermanent_loss(env.clone(), current, entry)
+    }
+
+    fn make_losses(env: &Env, pattern: &[bool]) -> Vec<bool> {
+        let mut v = Vec::new(env);
+        for &p in pattern {
+            v.push_back(p);
+        }
+        v
     }
 
     #[test]
