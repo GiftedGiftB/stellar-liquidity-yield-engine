@@ -24,12 +24,13 @@ import {
 } from "./types";
 import { waitForTransaction } from "./utils/transaction";
 
-export class RebalancerClient {
+export class RebalancerClient extends EventEmitter {
   private contract: Contract;
   private server: SorobanRpc.Server;
   private networkConfig: NetworkConfig;
 
   constructor(networkConfig: NetworkConfig) {
+    super();
     this.contract = new Contract(networkConfig.contracts.rebalanceEngine);
     this.server = new SorobanRpc.Server(networkConfig.sorobanRpcUrl);
     this.networkConfig = networkConfig;
@@ -414,6 +415,36 @@ export class RebalancerClient {
   }
 
   /**
+   * Check if a pool's APY observation is still fresh (within the configured maximum age).
+   *
+   * Returns true when the pool has an observation that is still within the
+   * configured maximum age, false otherwise.
+   */
+  async isApyFresh(poolId: Address): Promise<boolean> {
+    try {
+      const result = await this.server.simulateTransaction(
+        new TransactionBuilder(
+          await this.server.getAccount('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'),
+          {
+            fee: BASE_FEE,
+            networkPassphrase: this.getNetworkPassphrase()
+          }
+        )
+          .addOperation(this.contract.call('is_apy_fresh', poolId.toString()))
+          .build()
+      );
+
+      if (result.result?.status !== 'SUCCESS') {
+        throw new Error('Failed to check APY freshness');
+      }
+
+      return Boolean(scValToNative(result.result.returnValue));
+    } catch (error: any) {
+      throw new RebalanceError(`Freshness check failed: ${error.message}`, 'FRESHNESS_CHECK_ERROR');
+    }
+  }
+
+  /**
    * Calculate impermanent loss for a pool
    */
   async calculateImpermanentLoss(
@@ -507,6 +538,10 @@ export class RebalancerClient {
 
   /**
    * Pause rebalance engine (admin only)
+   * @param adminKeyPair - Admin keypair for signing
+   * @param reason - Reason for the pause (e.g., 'security', 'circuit_breaker', 'maintenance')
+   * @param reasonDetails - Additional context about the pause reason
+   * @param options - Transaction options
    */
   async pause(
     adminKeyPair: any,
@@ -532,6 +567,13 @@ export class RebalancerClient {
         gasUsed: 0,
         error: result.status === "ERROR" ? result.errorResult : undefined,
       };
+
+      // Emit pause event with reason if successful
+      if (transactionResult.success && reason) {
+        this.emitPauseEvent(reason, reasonDetails);
+      }
+
+      return transactionResult;
     } catch (error: any) {
       throw new RebalanceError(`Pause failed: ${error.message}`, "PAUSE_ERROR");
     }
@@ -777,6 +819,13 @@ export class RebalancerClient {
         gasUsed: 0,
         error: result.status === "ERROR" ? result.errorResult : undefined,
       };
+
+      // Emit unpause event if successful
+      if (transactionResult.success) {
+        this.emitUnpauseEvent();
+      }
+
+      return transactionResult;
     } catch (error: any) {
       throw new RebalanceError(
         `Set max APY age failed: ${error.message}`,
@@ -841,6 +890,34 @@ export class RebalancerClient {
         "IS_APY_FRESH_ERROR",
       );
     }
+  }
+
+  /**
+   * Emit a pause event with reason for monitoring and dashboards
+   */
+  private emitPauseEvent(reason: PauseReason, reasonDetails?: string): void {
+    const event: RebalanceEvent = {
+      type: 'pause',
+      strategy: 0, // Default strategy ID, can be overridden if needed
+      timestamp: Math.floor(Date.now() / 1000),
+      reason,
+      reasonDetails
+    };
+    this.emit('pause', event);
+    this.emit('rebalanceEvent', event);
+  }
+
+  /**
+   * Emit an unpause event for monitoring and dashboards
+   */
+  private emitUnpauseEvent(): void {
+    const event: RebalanceEvent = {
+      type: 'unpause',
+      strategy: 0, // Default strategy ID
+      timestamp: Math.floor(Date.now() / 1000)
+    };
+    this.emit('unpause', event);
+    this.emit('rebalanceEvent', event);
   }
 
   // Helper methods

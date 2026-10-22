@@ -454,6 +454,20 @@ export interface HarvestEfficiencyMetrics {
   avgGasPerHarvest: number;
 }
 
+/**
+ * Pause reason categories for vault and rebalance engine pause events.
+ * These help monitors and dashboards understand why a system was paused.
+ */
+export type PauseReason =
+  | 'security' // Security concern detected (exploit, suspicious activity)
+  | 'circuit_breaker' // Circuit breaker triggered (high volatility, large slippage)
+  | 'slippage_protection' // Price deviation exceeded threshold
+  | 'maintenance' // Scheduled maintenance or upgrade
+  | 'governance' // Governance decision or protocol vote
+  | 'liquidity_issue' // Insufficient liquidity in pool
+  | 'emergency' // Emergency situation requiring immediate pause
+  | 'manual'; // Manual administrative pause
+
 // Event Types
 export interface VaultEvent {
   type: "deposit" | "withdraw" | "harvest" | "pause" | "unpause";
@@ -462,6 +476,10 @@ export interface VaultEvent {
   amount?: bigint;
   timestamp: number;
   data?: any;
+  /** Reason for pause/unpause events */
+  reason?: PauseReason;
+  /** Additional context about the pause reason */
+  reasonDetails?: string;
 }
 
 export interface RebalanceEvent {
@@ -472,6 +490,10 @@ export interface RebalanceEvent {
   amount?: bigint;
   timestamp: number;
   data?: any;
+  /** Reason for pause/unpause events */
+  reason?: PauseReason;
+  /** Additional context about the pause reason */
+  reasonDetails?: string;
 }
 
 export interface RewardEvent {
