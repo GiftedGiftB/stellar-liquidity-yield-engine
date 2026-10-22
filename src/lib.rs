@@ -44,6 +44,10 @@ mod reward_distributor;
 mod strategy_registry;
 #[cfg(any(feature = "yield-vault", feature = "rebalance-engine"))]
 mod yield_vault;
+#[cfg(feature = "oracle-registry")]
+mod oracle_registry;
+#[cfg(feature = "risk-engine")]
+mod risk_engine;
 
 #[cfg(feature = "actuary")]
 pub use actuary::*;
@@ -57,6 +61,10 @@ pub use reward_distributor::*;
 pub use strategy_registry::*;
 #[cfg(feature = "yield-vault")]
 pub use yield_vault::*;
+#[cfg(feature = "oracle-registry")]
+pub use oracle_registry::*;
+#[cfg(feature = "risk-engine")]
+pub use risk_engine::*;
 
 #[cfg(feature = "engine")]
 #[contract]
@@ -170,12 +178,51 @@ impl StellarLiquidityYieldEngine {
         Self::append_emergency_record(&env, Symbol::new(&env, "unpause"), admin);
     }
 
+    /// Return true if the circuit breaker has tripped.
+    pub fn is_circuit_breaker_tripped(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "circuit_tripped"))
+            .unwrap_or(false)
+    }
+
+    /// Trip the circuit breaker and halt operations (admin only).
+    ///
+    /// This is the automatic-halt path: once tripped, operations are halted
+    /// until an admin explicitly resets the breaker.
+    pub fn trip_circuit_breaker(env: Env, admin: Address) {
+        Self::require_admin(&env, admin.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "circuit_tripped"), &true);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "paused"), &true);
+
+        env.events().publish(("circuit_breaker_tripped",), (admin,));
+    }
+
+    /// Manually reset the circuit breaker and unpause the contract (admin
+    /// only). This is the recovery path after an automatic halt, allowing the
+    /// system to resume without redeployment.
+    pub fn reset_circuit_breaker(env: Env, admin: Address) {
+        Self::require_admin(&env, admin.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "circuit_tripped"), &false);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "paused"), &false);
+
+        env.events().publish(("circuit_breaker_reset",), (admin,));
+    }
+
     /// Get admin address
     pub fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "admin"))
-            .unwrap()
+            .unwrap_or_else(|| panic!("admin not configured"))
     }
 
     /// Update admin
