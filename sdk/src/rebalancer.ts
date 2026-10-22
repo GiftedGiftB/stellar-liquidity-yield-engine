@@ -8,23 +8,21 @@ import {
   Networks,
   BASE_FEE,
   xdr,
-  scValToNative
-} from 'stellar-sdk';
-import { EventEmitter } from 'events';
+  scValToNative,
+} from "stellar-sdk";
 import {
   RebalanceStrategy,
   RebalanceProposal,
   RebalanceHistory,
   PoolAllocation,
+  PoolApyRecord,
   TransactionOptions,
   TransactionResult,
   TransactionSigner,
   RebalanceError,
   NetworkConfig,
-  PauseReason,
-  RebalanceEvent
-} from './types';
-import { waitForTransaction } from './utils/transaction';
+} from "./types";
+import { waitForTransaction } from "./utils/transaction";
 
 export class RebalancerClient extends EventEmitter {
   private contract: Contract;
@@ -49,42 +47,42 @@ export class RebalancerClient extends EventEmitter {
     maxIlRisk: number,
     rebalanceFrequency: number,
     allocations: PoolAllocation[],
-    options?: TransactionOptions
+    options?: TransactionOptions,
   ): Promise<TransactionResult & { strategyId: number }> {
     try {
       const account = await this.server.getAccount(adminKeyPair.publicKey());
-      
+
       const tx = new TransactionBuilder(account, {
         fee: options?.gasLimit ? `${options.gasLimit}` : BASE_FEE,
-        networkPassphrase: this.getNetworkPassphrase()
+        networkPassphrase: this.getNetworkPassphrase(),
       })
         .addOperation(
           this.contract.call(
-            'create_strategy',
+            "create_strategy",
             adminKeyPair.publicKey(),
             name,
             riskLevel.toString(),
             minApyThreshold.toString(),
             maxIlRisk.toString(),
             rebalanceFrequency.toString(),
-            this.formatAllocations(allocations)
-          )
+            this.formatAllocations(allocations),
+          ),
         )
         .setTimeout(options?.timeout || 30)
         .build();
 
       const signedTx = adminKeyPair.sign(tx);
       const result = await this.server.sendTransaction(signedTx);
-      
-      if (result.status === 'SUCCESS') {
+
+      if (result.status === "SUCCESS") {
         const txResult = await waitForTransaction(this.server, result.hash);
         const strategyId = Number(txResult.result!.returnValue);
-        
+
         return {
           hash: result.hash,
           success: true,
           gasUsed: 0,
-          strategyId
+          strategyId,
         };
       } else {
         return {
@@ -92,11 +90,14 @@ export class RebalancerClient extends EventEmitter {
           success: false,
           gasUsed: 0,
           error: result.errorResult,
-          strategyId: 0
+          strategyId: 0,
         };
       }
     } catch (error: any) {
-      throw new RebalanceError(`Create strategy failed: ${error.message}`, 'CREATE_STRATEGY_ERROR');
+      throw new RebalanceError(
+        `Create strategy failed: ${error.message}`,
+        "CREATE_STRATEGY_ERROR",
+      );
     }
   }
 
@@ -112,18 +113,18 @@ export class RebalancerClient extends EventEmitter {
     maxIlRisk: number,
     rebalanceFrequency: number,
     allocations: PoolAllocation[],
-    options?: TransactionOptions
+    options?: TransactionOptions,
   ): Promise<TransactionResult> {
     try {
       const account = await this.server.getAccount(adminKeyPair.publicKey());
-      
+
       const tx = new TransactionBuilder(account, {
         fee: options?.gasLimit ? `${options.gasLimit}` : BASE_FEE,
-        networkPassphrase: this.getNetworkPassphrase()
+        networkPassphrase: this.getNetworkPassphrase(),
       })
         .addOperation(
           this.contract.call(
-            'update_strategy',
+            "update_strategy",
             adminKeyPair.publicKey(),
             strategyId.toString(),
             name,
@@ -131,23 +132,26 @@ export class RebalancerClient extends EventEmitter {
             minApyThreshold.toString(),
             maxIlRisk.toString(),
             rebalanceFrequency.toString(),
-            this.formatAllocations(allocations)
-          )
+            this.formatAllocations(allocations),
+          ),
         )
         .setTimeout(options?.timeout || 30)
         .build();
 
       const signedTx = adminKeyPair.sign(tx);
       const result = await this.server.sendTransaction(signedTx);
-      
+
       return {
         hash: result.hash,
-        success: result.status === 'SUCCESS',
+        success: result.status === "SUCCESS",
         gasUsed: 0,
-        error: result.status === 'ERROR' ? result.errorResult : undefined
+        error: result.status === "ERROR" ? result.errorResult : undefined,
       };
     } catch (error: any) {
-      throw new RebalanceError(`Update strategy failed: ${error.message}`, 'UPDATE_STRATEGY_ERROR');
+      throw new RebalanceError(
+        `Update strategy failed: ${error.message}`,
+        "UPDATE_STRATEGY_ERROR",
+      );
     }
   }
 
@@ -155,28 +159,38 @@ export class RebalancerClient extends EventEmitter {
    * Analyze rebalance opportunities for a strategy
    */
   async analyzeRebalanceOpportunities(
-    strategyId: number
+    strategyId: number,
   ): Promise<RebalanceProposal[]> {
     try {
       const result = await this.server.simulateTransaction(
         new TransactionBuilder(
-          await this.server.getAccount('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'),
+          await this.server.getAccount(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          ),
           {
             fee: BASE_FEE,
-            networkPassphrase: this.getNetworkPassphrase()
-          }
+            networkPassphrase: this.getNetworkPassphrase(),
+          },
         )
-          .addOperation(this.contract.call('analyze_rebalance_opportunities', strategyId.toString()))
-          .build()
+          .addOperation(
+            this.contract.call(
+              "analyze_rebalance_opportunities",
+              strategyId.toString(),
+            ),
+          )
+          .build(),
       );
 
-      if (result.result?.status !== 'SUCCESS') {
-        throw new Error('Failed to analyze rebalance opportunities');
+      if (result.result?.status !== "SUCCESS") {
+        throw new Error("Failed to analyze rebalance opportunities");
       }
 
       return this.parseRebalanceProposals(result.result.returnValue);
     } catch (error: any) {
-      throw new RebalanceError(`Analysis failed: ${error.message}`, 'ANALYSIS_ERROR');
+      throw new RebalanceError(
+        `Analysis failed: ${error.message}`,
+        "ANALYSIS_ERROR",
+      );
     }
   }
 
@@ -190,36 +204,37 @@ export class RebalancerClient extends EventEmitter {
   async executeRebalance(
     userKeyPair: Keypair | TransactionSigner,
     proposal: RebalanceProposal,
-    options?: TransactionOptions
+    options?: TransactionOptions,
   ): Promise<TransactionResult & { executed: boolean }> {
     try {
       if (!userKeyPair) {
         throw new RebalanceError(
-          'A keypair or wallet signer is required to execute a rebalance',
-          'SIGNER_REQUIRED'
+          "A keypair or wallet signer is required to execute a rebalance",
+          "SIGNER_REQUIRED",
         );
       }
 
       const usesWalletSigner =
-        typeof (userKeyPair as TransactionSigner).signTransaction === 'function';
+        typeof (userKeyPair as TransactionSigner).signTransaction ===
+        "function";
 
       const publicKey = usesWalletSigner
         ? await (userKeyPair as TransactionSigner).getPublicKey()
         : (userKeyPair as Keypair).publicKey();
 
       const account = await this.server.getAccount(publicKey);
-      
+
       const tx = new TransactionBuilder(account, {
         fee: options?.gasLimit ? `${options.gasLimit}` : BASE_FEE,
-        networkPassphrase: this.getNetworkPassphrase()
+        networkPassphrase: this.getNetworkPassphrase(),
       })
         .addOperation(
           this.contract.call(
-            'execute_rebalance',
+            "execute_rebalance",
             // Matches the string-argument style used throughout this client.
             publicKey as any,
-            this.formatRebalanceProposal(proposal)
-          )
+            this.formatRebalanceProposal(proposal),
+          ),
         )
         .setTimeout(options?.timeout || 30)
         .build();
@@ -228,7 +243,7 @@ export class RebalancerClient extends EventEmitter {
       if (usesWalletSigner) {
         signedTx = await (userKeyPair as TransactionSigner).signTransaction(
           tx,
-          this.getNetworkPassphrase()
+          this.getNetworkPassphrase(),
         );
       } else {
         tx.sign(userKeyPair as Keypair);
@@ -236,16 +251,16 @@ export class RebalancerClient extends EventEmitter {
       }
 
       const result = await this.server.sendTransaction(signedTx);
-      
-      if (result.status === 'SUCCESS') {
+
+      if (result.status === "SUCCESS") {
         const txResult = await waitForTransaction(this.server, result.hash);
         const executed = Boolean(txResult.result!.returnValue);
-        
+
         return {
           hash: result.hash,
           success: true,
           gasUsed: 0,
-          executed
+          executed,
         };
       } else {
         return {
@@ -253,11 +268,14 @@ export class RebalancerClient extends EventEmitter {
           success: false,
           gasUsed: 0,
           error: result.errorResult,
-          executed: false
+          executed: false,
         };
       }
     } catch (error: any) {
-      throw new RebalanceError(`Execute rebalance failed: ${error.message}`, 'EXECUTE_ERROR');
+      throw new RebalanceError(
+        `Execute rebalance failed: ${error.message}`,
+        "EXECUTE_ERROR",
+      );
     }
   }
 
@@ -268,23 +286,28 @@ export class RebalancerClient extends EventEmitter {
     try {
       const result = await this.server.simulateTransaction(
         new TransactionBuilder(
-          await this.server.getAccount('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'),
+          await this.server.getAccount(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          ),
           {
             fee: BASE_FEE,
-            networkPassphrase: this.getNetworkPassphrase()
-          }
+            networkPassphrase: this.getNetworkPassphrase(),
+          },
         )
-          .addOperation(this.contract.call('get_strategies'))
-          .build()
+          .addOperation(this.contract.call("get_strategies"))
+          .build(),
       );
 
-      if (result.result?.status !== 'SUCCESS') {
-        throw new Error('Failed to get strategies');
+      if (result.result?.status !== "SUCCESS") {
+        throw new Error("Failed to get strategies");
       }
 
       return this.parseStrategies(result.result.returnValue);
     } catch (error: any) {
-      throw new RebalanceError(`Failed to get strategies: ${error.message}`, 'GET_STRATEGIES_ERROR');
+      throw new RebalanceError(
+        `Failed to get strategies: ${error.message}`,
+        "GET_STRATEGIES_ERROR",
+      );
     }
   }
 
@@ -295,23 +318,30 @@ export class RebalancerClient extends EventEmitter {
     try {
       const result = await this.server.simulateTransaction(
         new TransactionBuilder(
-          await this.server.getAccount('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'),
+          await this.server.getAccount(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          ),
           {
             fee: BASE_FEE,
-            networkPassphrase: this.getNetworkPassphrase()
-          }
+            networkPassphrase: this.getNetworkPassphrase(),
+          },
         )
-          .addOperation(this.contract.call('get_strategy', strategyId.toString()))
-          .build()
+          .addOperation(
+            this.contract.call("get_strategy", strategyId.toString()),
+          )
+          .build(),
       );
 
-      if (result.result?.status !== 'SUCCESS') {
-        throw new Error('Failed to get strategy');
+      if (result.result?.status !== "SUCCESS") {
+        throw new Error("Failed to get strategy");
       }
 
       return this.parseStrategy(result.result.returnValue);
     } catch (error: any) {
-      throw new RebalanceError(`Failed to get strategy: ${error.message}`, 'GET_STRATEGY_ERROR');
+      throw new RebalanceError(
+        `Failed to get strategy: ${error.message}`,
+        "GET_STRATEGY_ERROR",
+      );
     }
   }
 
@@ -322,23 +352,28 @@ export class RebalancerClient extends EventEmitter {
     try {
       const result = await this.server.simulateTransaction(
         new TransactionBuilder(
-          await this.server.getAccount('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'),
+          await this.server.getAccount(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          ),
           {
             fee: BASE_FEE,
-            networkPassphrase: this.getNetworkPassphrase()
-          }
+            networkPassphrase: this.getNetworkPassphrase(),
+          },
         )
-          .addOperation(this.contract.call('get_history', limit.toString()))
-          .build()
+          .addOperation(this.contract.call("get_history", limit.toString()))
+          .build(),
       );
 
-      if (result.result?.status !== 'SUCCESS') {
-        throw new Error('Failed to get history');
+      if (result.result?.status !== "SUCCESS") {
+        throw new Error("Failed to get history");
       }
 
       return this.parseHistory(result.result.returnValue);
     } catch (error: any) {
-      throw new RebalanceError(`Failed to get history: ${error.message}`, 'GET_HISTORY_ERROR');
+      throw new RebalanceError(
+        `Failed to get history: ${error.message}`,
+        "GET_HISTORY_ERROR",
+      );
     }
   }
 
@@ -349,23 +384,33 @@ export class RebalancerClient extends EventEmitter {
     try {
       const result = await this.server.simulateTransaction(
         new TransactionBuilder(
-          await this.server.getAccount('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'),
+          await this.server.getAccount(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          ),
           {
             fee: BASE_FEE,
-            networkPassphrase: this.getNetworkPassphrase()
-          }
+            networkPassphrase: this.getNetworkPassphrase(),
+          },
         )
-          .addOperation(this.contract.call('get_current_allocations', strategyId.toString()))
-          .build()
+          .addOperation(
+            this.contract.call(
+              "get_current_allocations",
+              strategyId.toString(),
+            ),
+          )
+          .build(),
       );
 
-      if (result.result?.status !== 'SUCCESS') {
-        throw new Error('Failed to get current allocations');
+      if (result.result?.status !== "SUCCESS") {
+        throw new Error("Failed to get current allocations");
       }
 
       return this.parseAllocations(result.result.returnValue);
     } catch (error: any) {
-      throw new RebalanceError(`Failed to get allocations: ${error.message}`, 'GET_ALLOCATIONS_ERROR');
+      throw new RebalanceError(
+        `Failed to get allocations: ${error.message}`,
+        "GET_ALLOCATIONS_ERROR",
+      );
     }
   }
 
@@ -405,35 +450,40 @@ export class RebalancerClient extends EventEmitter {
   async calculateImpermanentLoss(
     poolId: Address,
     priceRatio: number,
-    initialPriceRatio: number
+    initialPriceRatio: number,
   ): Promise<number> {
     try {
       const result = await this.server.simulateTransaction(
         new TransactionBuilder(
-          await this.server.getAccount('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'),
+          await this.server.getAccount(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          ),
           {
             fee: BASE_FEE,
-            networkPassphrase: this.getNetworkPassphrase()
-          }
+            networkPassphrase: this.getNetworkPassphrase(),
+          },
         )
           .addOperation(
             this.contract.call(
-              'calculate_impermanent_loss',
+              "calculate_impermanent_loss",
               poolId,
               priceRatio.toString(),
-              initialPriceRatio.toString()
-            )
+              initialPriceRatio.toString(),
+            ),
           )
-          .build()
+          .build(),
       );
 
-      if (result.result?.status !== 'SUCCESS') {
-        throw new Error('Failed to calculate impermanent loss');
+      if (result.result?.status !== "SUCCESS") {
+        throw new Error("Failed to calculate impermanent loss");
       }
 
       return Number(result.result.returnValue);
     } catch (error: any) {
-      throw new RebalanceError(`IL calculation failed: ${error.message}`, 'IL_CALCULATION_ERROR');
+      throw new RebalanceError(
+        `IL calculation failed: ${error.message}`,
+        "IL_CALCULATION_ERROR",
+      );
     }
   }
 
@@ -443,7 +493,7 @@ export class RebalancerClient extends EventEmitter {
   async simulateRebalance(
     strategyId: number,
     currentAllocations: PoolAllocation[],
-    marketConditions: any
+    marketConditions: any,
   ): Promise<{
     proposals: RebalanceProposal[];
     expectedApyImprovement: number;
@@ -452,30 +502,37 @@ export class RebalancerClient extends EventEmitter {
   }> {
     try {
       const proposals = await this.analyzeRebalanceOpportunities(strategyId);
-      
+
       // Calculate expected APY improvement
       let totalApyImprovement = 0;
       for (const proposal of proposals) {
         totalApyImprovement += proposal.expectedApyImprovement;
       }
-      
+
       // Estimate total gas cost
       let totalGasCost = 0n;
       for (const proposal of proposals) {
         totalGasCost += proposal.estimatedGasCost;
       }
-      
+
       // Assess risk based on IL and market volatility
-      const riskAssessment = this.calculateRiskAssessment(proposals, marketConditions);
-      
+      const riskAssessment = this.calculateRiskAssessment(
+        proposals,
+        marketConditions,
+      );
+
       return {
         proposals,
-        expectedApyImprovement: totalApyImprovement / Math.max(proposals.length, 1),
+        expectedApyImprovement:
+          totalApyImprovement / Math.max(proposals.length, 1),
         estimatedGasCost: totalGasCost,
-        riskAssessment
+        riskAssessment,
       };
     } catch (error: any) {
-      throw new RebalanceError(`Simulation failed: ${error.message}`, 'SIMULATION_ERROR');
+      throw new RebalanceError(
+        `Simulation failed: ${error.message}`,
+        "SIMULATION_ERROR",
+      );
     }
   }
 
@@ -488,29 +545,27 @@ export class RebalancerClient extends EventEmitter {
    */
   async pause(
     adminKeyPair: any,
-    reason?: PauseReason,
-    reasonDetails?: string,
-    options?: TransactionOptions
+    options?: TransactionOptions,
   ): Promise<TransactionResult> {
     try {
       const account = await this.server.getAccount(adminKeyPair.publicKey());
 
       const tx = new TransactionBuilder(account, {
         fee: options?.gasLimit ? `${options.gasLimit}` : BASE_FEE,
-        networkPassphrase: this.getNetworkPassphrase()
+        networkPassphrase: this.getNetworkPassphrase(),
       })
-        .addOperation(this.contract.call('pause', adminKeyPair.publicKey()))
+        .addOperation(this.contract.call("pause", adminKeyPair.publicKey()))
         .setTimeout(options?.timeout || 30)
         .build();
 
       const signedTx = adminKeyPair.sign(tx);
       const result = await this.server.sendTransaction(signedTx);
 
-      const transactionResult = {
+      return {
         hash: result.hash,
-        success: result.status === 'SUCCESS',
+        success: result.status === "SUCCESS",
         gasUsed: 0,
-        error: result.status === 'ERROR' ? result.errorResult : undefined
+        error: result.status === "ERROR" ? result.errorResult : undefined,
       };
 
       // Emit pause event with reason if successful
@@ -520,33 +575,249 @@ export class RebalancerClient extends EventEmitter {
 
       return transactionResult;
     } catch (error: any) {
-      throw new RebalanceError(`Pause failed: ${error.message}`, 'PAUSE_ERROR');
+      throw new RebalanceError(`Pause failed: ${error.message}`, "PAUSE_ERROR");
     }
   }
 
   /**
    * Unpause rebalance engine (admin only)
    */
-  async unpause(adminKeyPair: any, options?: TransactionOptions): Promise<TransactionResult> {
+  async unpause(
+    adminKeyPair: any,
+    options?: TransactionOptions,
+  ): Promise<TransactionResult> {
     try {
       const account = await this.server.getAccount(adminKeyPair.publicKey());
 
       const tx = new TransactionBuilder(account, {
         fee: options?.gasLimit ? `${options.gasLimit}` : BASE_FEE,
-        networkPassphrase: this.getNetworkPassphrase()
+        networkPassphrase: this.getNetworkPassphrase(),
       })
-        .addOperation(this.contract.call('unpause', adminKeyPair.publicKey()))
+        .addOperation(this.contract.call("unpause", adminKeyPair.publicKey()))
         .setTimeout(options?.timeout || 30)
         .build();
 
       const signedTx = adminKeyPair.sign(tx);
       const result = await this.server.sendTransaction(signedTx);
 
-      const transactionResult = {
+      return {
         hash: result.hash,
-        success: result.status === 'SUCCESS',
+        success: result.status === "SUCCESS",
         gasUsed: 0,
-        error: result.status === 'ERROR' ? result.errorResult : undefined
+        error: result.status === "ERROR" ? result.errorResult : undefined,
+      };
+    } catch (error: any) {
+      throw new RebalanceError(
+        `Unpause failed: ${error.message}`,
+        "UNPAUSE_ERROR",
+      );
+    }
+  }
+
+  /** Manage dedicated APY oracle keepers. Admin-only setter; keepers may publish data without admin privileges. */
+  async setApyKeepers(
+    adminKeyPair: Keypair | TransactionSigner,
+    keepers: string[],
+    options?: TransactionOptions,
+  ): Promise<TransactionResult> {
+    try {
+      const publicKey = await this.resolvePublicKey(adminKeyPair);
+      const account = await this.server.getAccount(publicKey);
+      const tx = new TransactionBuilder(account, {
+        fee: options?.gasLimit ? `${options.gasLimit}` : BASE_FEE,
+        networkPassphrase: this.getNetworkPassphrase(),
+      })
+        .addOperation(this.contract.call("set_apy_keepers", publicKey, keepers))
+        .setTimeout(options?.timeout || 30)
+        .build();
+
+      const signedTx = await this.signTransaction(adminKeyPair, tx);
+      const result = await this.server.sendTransaction(signedTx);
+
+      return {
+        hash: result.hash,
+        success: result.status === "SUCCESS",
+        gasUsed: 0,
+        error: result.status === "ERROR" ? result.errorResult : undefined,
+      };
+    } catch (error: any) {
+      throw new RebalanceError(
+        `Set APY keepers failed: ${error.message}`,
+        "SET_APY_KEEPERS_ERROR",
+      );
+    }
+  }
+
+  async getApyKeepers(): Promise<string[]> {
+    try {
+      const result = await this.server.simulateTransaction(
+        new TransactionBuilder(
+          await this.server.getAccount(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          ),
+          {
+            fee: BASE_FEE,
+            networkPassphrase: this.getNetworkPassphrase(),
+          },
+        )
+          .addOperation(this.contract.call("get_apy_keepers"))
+          .build(),
+      );
+
+      if (result.result?.status !== "SUCCESS") {
+        throw new Error("Failed to get APY keepers");
+      }
+
+      const data = scValToNative(result.result.returnValue) as string[];
+      return Array.isArray(data) ? data : [];
+    } catch (error: any) {
+      throw new RebalanceError(
+        `Failed to get APY keepers: ${error.message}`,
+        "GET_APY_KEEPERS_ERROR",
+      );
+    }
+  }
+
+  async updatePoolApy(
+    keeperKeyPair: Keypair | TransactionSigner,
+    poolId: Address | string,
+    apyBps: number,
+    options?: TransactionOptions,
+  ): Promise<TransactionResult> {
+    try {
+      const publicKey = await this.resolvePublicKey(keeperKeyPair);
+      const account = await this.server.getAccount(publicKey);
+      const tx = new TransactionBuilder(account, {
+        fee: options?.gasLimit ? `${options.gasLimit}` : BASE_FEE,
+        networkPassphrase: this.getNetworkPassphrase(),
+      })
+        .addOperation(
+          this.contract.call(
+            "update_pool_apy",
+            publicKey,
+            poolId.toString(),
+            apyBps.toString(),
+          ),
+        )
+        .setTimeout(options?.timeout || 30)
+        .build();
+
+      const signedTx = await this.signTransaction(keeperKeyPair, tx);
+      const result = await this.server.sendTransaction(signedTx);
+
+      return {
+        hash: result.hash,
+        success: result.status === "SUCCESS",
+        gasUsed: 0,
+        error: result.status === "ERROR" ? result.errorResult : undefined,
+      };
+    } catch (error: any) {
+      throw new RebalanceError(
+        `Update pool APY failed: ${error.message}`,
+        "UPDATE_POOL_APY_ERROR",
+      );
+    }
+  }
+
+  async getPoolCurrentApy(poolId: Address | string): Promise<number> {
+    try {
+      const result = await this.server.simulateTransaction(
+        new TransactionBuilder(
+          await this.server.getAccount(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          ),
+          {
+            fee: BASE_FEE,
+            networkPassphrase: this.getNetworkPassphrase(),
+          },
+        )
+          .addOperation(
+            this.contract.call("get_pool_current_apy", poolId.toString()),
+          )
+          .build(),
+      );
+
+      if (result.result?.status !== "SUCCESS") {
+        throw new Error("Failed to get pool APY");
+      }
+
+      return Number(scValToNative(result.result.returnValue));
+    } catch (error: any) {
+      throw new RebalanceError(
+        `Failed to get pool APY: ${error.message}`,
+        "GET_POOL_APY_ERROR",
+      );
+    }
+  }
+
+  async getPoolApyRecord(
+    poolId: Address | string,
+  ): Promise<PoolApyRecord | null> {
+    try {
+      const result = await this.server.simulateTransaction(
+        new TransactionBuilder(
+          await this.server.getAccount(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          ),
+          {
+            fee: BASE_FEE,
+            networkPassphrase: this.getNetworkPassphrase(),
+          },
+        )
+          .addOperation(
+            this.contract.call("get_pool_apy_record", poolId.toString()),
+          )
+          .build(),
+      );
+
+      if (result.result?.status !== "SUCCESS") {
+        throw new Error("Failed to get pool APY record");
+      }
+
+      const record = scValToNative(result.result.returnValue) as any;
+      if (!record) {
+        return null;
+      }
+
+      return {
+        apyBps: Number(record.apy_bps),
+        updatedAt: Number(record.updated_at),
+        updatedBy: new Address(record.updated_by).toString(),
+      };
+    } catch (error: any) {
+      throw new RebalanceError(
+        `Failed to get pool APY record: ${error.message}`,
+        "GET_POOL_APY_RECORD_ERROR",
+      );
+    }
+  }
+
+  async setMaxApyAge(
+    adminKeyPair: Keypair | TransactionSigner,
+    maxAge: number,
+    options?: TransactionOptions,
+  ): Promise<TransactionResult> {
+    try {
+      const publicKey = await this.resolvePublicKey(adminKeyPair);
+      const account = await this.server.getAccount(publicKey);
+      const tx = new TransactionBuilder(account, {
+        fee: options?.gasLimit ? `${options.gasLimit}` : BASE_FEE,
+        networkPassphrase: this.getNetworkPassphrase(),
+      })
+        .addOperation(
+          this.contract.call("set_max_apy_age", publicKey, maxAge.toString()),
+        )
+        .setTimeout(options?.timeout || 30)
+        .build();
+
+      const signedTx = await this.signTransaction(adminKeyPair, tx);
+      const result = await this.server.sendTransaction(signedTx);
+
+      return {
+        hash: result.hash,
+        success: result.status === "SUCCESS",
+        gasUsed: 0,
+        error: result.status === "ERROR" ? result.errorResult : undefined,
       };
 
       // Emit unpause event if successful
@@ -556,7 +827,68 @@ export class RebalancerClient extends EventEmitter {
 
       return transactionResult;
     } catch (error: any) {
-      throw new RebalanceError(`Unpause failed: ${error.message}`, 'UNPAUSE_ERROR');
+      throw new RebalanceError(
+        `Set max APY age failed: ${error.message}`,
+        "SET_MAX_APY_AGE_ERROR",
+      );
+    }
+  }
+
+  async getMaxApyAge(): Promise<number> {
+    try {
+      const result = await this.server.simulateTransaction(
+        new TransactionBuilder(
+          await this.server.getAccount(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          ),
+          {
+            fee: BASE_FEE,
+            networkPassphrase: this.getNetworkPassphrase(),
+          },
+        )
+          .addOperation(this.contract.call("get_max_apy_age"))
+          .build(),
+      );
+
+      if (result.result?.status !== "SUCCESS") {
+        throw new Error("Failed to get max APY age");
+      }
+
+      return Number(scValToNative(result.result.returnValue));
+    } catch (error: any) {
+      throw new RebalanceError(
+        `Failed to get max APY age: ${error.message}`,
+        "GET_MAX_APY_AGE_ERROR",
+      );
+    }
+  }
+
+  async isApyFresh(poolId: Address | string): Promise<boolean> {
+    try {
+      const result = await this.server.simulateTransaction(
+        new TransactionBuilder(
+          await this.server.getAccount(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          ),
+          {
+            fee: BASE_FEE,
+            networkPassphrase: this.getNetworkPassphrase(),
+          },
+        )
+          .addOperation(this.contract.call("is_apy_fresh", poolId.toString()))
+          .build(),
+      );
+
+      if (result.result?.status !== "SUCCESS") {
+        throw new Error("Failed to check APY freshness");
+      }
+
+      return Boolean(scValToNative(result.result.returnValue));
+    } catch (error: any) {
+      throw new RebalanceError(
+        `Failed to check APY freshness: ${error.message}`,
+        "IS_APY_FRESH_ERROR",
+      );
     }
   }
 
@@ -591,26 +923,56 @@ export class RebalancerClient extends EventEmitter {
   // Helper methods
   private getNetworkPassphrase(): string {
     switch (this.networkConfig.network) {
-      case 'mainnet':
+      case "mainnet":
         return Networks.PUBLIC;
-      case 'testnet':
+      case "testnet":
         return Networks.TESTNET;
-      case 'futurenet':
+      case "futurenet":
         return Networks.FUTURENET;
       default:
-        throw new RebalanceError('Invalid network configuration', 'INVALID_NETWORK');
+        throw new RebalanceError(
+          "Invalid network configuration",
+          "INVALID_NETWORK",
+        );
     }
   }
 
+  private async resolvePublicKey(
+    signer: Keypair | TransactionSigner,
+  ): Promise<string> {
+    if (typeof (signer as TransactionSigner).getPublicKey === "function") {
+      return await (signer as TransactionSigner).getPublicKey();
+    }
+    return (signer as Keypair).publicKey();
+  }
+
+  private async signTransaction(
+    signer: Keypair | TransactionSigner,
+    tx: Transaction,
+  ): Promise<Transaction> {
+    const usesWalletSigner =
+      typeof (signer as TransactionSigner).signTransaction === "function";
+
+    if (usesWalletSigner) {
+      return await (signer as TransactionSigner).signTransaction(
+        tx,
+        this.getNetworkPassphrase(),
+      );
+    }
+
+    (signer as Keypair).sign(tx);
+    return tx;
+  }
+
   private formatAllocations(allocations: PoolAllocation[]): any {
-    return allocations.map(alloc => ({
+    return allocations.map((alloc) => ({
       pool_id: alloc.poolId.toString(),
       token_a: alloc.tokenA.toString(),
       token_b: alloc.tokenB.toString(),
       allocation_percent: alloc.allocationPercent.toString(),
       target_apy: alloc.targetApy.toString(),
       current_apy: alloc.currentApy.toString(),
-      impermanent_loss_risk: alloc.impermanentLossRisk.toString()
+      impermanent_loss_risk: alloc.impermanentLossRisk.toString(),
     }));
   }
 
@@ -622,7 +984,7 @@ export class RebalancerClient extends EventEmitter {
       amount_b: proposal.amountB.toString(),
       expected_apy_improvement: proposal.expectedApyImprovement.toString(),
       estimated_gas_cost: proposal.estimatedGasCost.toString(),
-      timestamp: proposal.timestamp.toString()
+      timestamp: proposal.timestamp.toString(),
     };
   }
 
@@ -643,7 +1005,7 @@ export class RebalancerClient extends EventEmitter {
       amountB: BigInt(item.amount_b),
       expectedApyImprovement: Number(item.expected_apy_improvement),
       estimatedGasCost: BigInt(item.estimated_gas_cost),
-      timestamp: Number(item.timestamp)
+      timestamp: Number(item.timestamp),
     }));
   }
 
@@ -657,7 +1019,7 @@ export class RebalancerClient extends EventEmitter {
       minApyThreshold: Number(strategy.min_apy_threshold),
       maxIlRisk: Number(strategy.max_il_risk),
       rebalanceFrequency: Number(strategy.rebalance_frequency),
-      allocations: this.parseAllocationsValue(strategy.allocations)
+      allocations: this.parseAllocationsValue(strategy.allocations),
     }));
   }
 
@@ -670,7 +1032,7 @@ export class RebalancerClient extends EventEmitter {
       minApyThreshold: Number(data.min_apy_threshold),
       maxIlRisk: Number(data.max_il_risk),
       rebalanceFrequency: Number(data.rebalance_frequency),
-      allocations: this.parseAllocationsValue(data.allocations)
+      allocations: this.parseAllocationsValue(data.allocations),
     };
   }
 
@@ -687,7 +1049,7 @@ export class RebalancerClient extends EventEmitter {
       allocationPercent: Number(alloc.allocation_percent),
       targetApy: Number(alloc.target_apy),
       currentApy: Number(alloc.current_apy),
-      impermanentLossRisk: Number(alloc.impermanent_loss_risk)
+      impermanentLossRisk: Number(alloc.impermanent_loss_risk),
     }));
   }
 
@@ -701,22 +1063,25 @@ export class RebalancerClient extends EventEmitter {
       amountMoved: BigInt(item.amount_moved),
       apyBefore: Number(item.apy_before),
       apyAfter: Number(item.apy_after),
-      success: Boolean(item.success)
+      success: Boolean(item.success),
     }));
   }
 
-  private calculateRiskAssessment(proposals: RebalanceProposal[], marketConditions: any): number {
+  private calculateRiskAssessment(
+    proposals: RebalanceProposal[],
+    marketConditions: any,
+  ): number {
     // Simple risk assessment based on IL risk and market volatility
     let totalRisk = 0;
     for (const proposal of proposals) {
       // Risk increases with expected APY improvement (higher reward = higher risk)
       totalRisk += proposal.expectedApyImprovement / 100;
     }
-    
+
     // Factor in market volatility
     const volatilityFactor = marketConditions.volatility || 1;
     totalRisk *= volatilityFactor;
-    
+
     // Normalize to 0-100 scale
     return Math.min(Math.max(totalRisk, 0), 100);
   }
