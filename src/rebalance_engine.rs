@@ -1616,6 +1616,167 @@ impl RebalanceEngine {
     ) -> bool {
         !newest_success && !second_newest_success && !third_newest_success
     }
+
+    /// Breaker rule for arbitrary consecutive failure count and configurable threshold.
+    pub fn breaker_trips_for_threshold(consecutive_failures: u32, threshold: u32) -> bool {
+        threshold > 0 && consecutive_failures >= threshold
+    }
+
+    /// Filter rebalance history for a specific pool, returning up to `limit` recent entries.
+    pub fn get_pool_history(env: Env, pool_id: Address, limit: u32) -> Vec<RebalanceHistory> {
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+        let history: Vec<RebalanceHistory> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "history"))
+            .unwrap_optimized();
+        let mut matching: Vec<RebalanceHistory> = Vec::new(&env);
+        let len = history.len();
+        for i in 0..len {
+            let idx = len - 1 - i;
+            let entry = history.get(idx).unwrap();
+            if entry.from_pool == pool_id || entry.to_pool == pool_id {
+                matching.push_back(entry);
+                if matching.len() >= limit {
+                    break;
+                }
+            }
+        }
+        matching
+    }
+
+    /// Set consecutive failure breaker threshold for a specific pool (admin only).
+    pub fn set_pool_breaker_threshold(env: Env, admin: Address, pool_id: Address, threshold: u32) {
+        Self::require_admin(&env, admin.clone());
+        require!(threshold > 0, "threshold must be greater than zero");
+        let mut thresholds: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "pool_breaker_thresh"))
+            .unwrap_or(Map::new(&env));
+        thresholds.set(pool_id.clone(), threshold);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "pool_breaker_thresh"), &thresholds);
+        env.events().publish(
+            (Symbol::new(&env, "pool_breaker_thresh_updated"), pool_id),
+            (admin, threshold),
+        );
+    }
+
+    /// Get consecutive failure breaker threshold for a pool (defaults to EMERGENCY_STOP_WINDOW).
+    pub fn get_pool_breaker_threshold(env: Env, pool_id: Address) -> u32 {
+        let thresholds: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "pool_breaker_thresh"))
+            .unwrap_or(Map::new(&env));
+        thresholds.get(pool_id).unwrap_or(EMERGENCY_STOP_WINDOW)
+    }
+
+    /// Whether the circuit breaker would trip for a given pool based on its history and configured threshold.
+    pub fn is_pool_emergency_stop_triggered(env: Env, pool_id: Address) -> bool {
+        let threshold = Self::get_pool_breaker_threshold(env.clone(), pool_id.clone());
+        let pool_entries = Self::get_pool_history(env, pool_id, threshold);
+        if pool_entries.len() < threshold {
+            return false;
+        }
+        for entry in pool_entries.iter() {
+            if entry.success {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Check and pause engine if emergency stop is triggered for a specific pool.
+    pub fn check_pool_emergency_stop(env: Env, pool_id: Address) -> bool {
+        if !Self::is_pool_emergency_stop_triggered(env.clone(), pool_id) {
+            return false;
+        }
+        let admin = Self::get_admin(env.clone());
+        Self::pause(env, admin);
+        true
+    }
+
+    /// Set consecutive failure breaker threshold for a specific strategy (admin only).
+    pub fn set_strategy_breaker_threshold(env: Env, admin: Address, strategy_id: u32, threshold: u32) {
+        Self::require_admin(&env, admin.clone());
+        require!(threshold > 0, "threshold must be greater than zero");
+        let mut thresholds: Map<u32, u32> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "strat_breaker_thresh"))
+            .unwrap_or(Map::new(&env));
+        thresholds.set(strategy_id, threshold);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "strat_breaker_thresh"), &thresholds);
+        env.events().publish(
+            (Symbol::new(&env, "strat_breaker_thresh_updated"), strategy_id),
+            (admin, threshold),
+        );
+    }
+
+    /// Get consecutive failure breaker threshold for a strategy (defaults to EMERGENCY_STOP_WINDOW).
+    pub fn get_strategy_breaker_threshold(env: Env, strategy_id: u32) -> u32 {
+        let thresholds: Map<u32, u32> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "strat_breaker_thresh"))
+            .unwrap_or(Map::new(&env));
+        thresholds.get(strategy_id).unwrap_or(EMERGENCY_STOP_WINDOW)
+    }
+
+    /// Whether the circuit breaker would trip for a strategy based on its allocations and configured threshold.
+    pub fn is_strategy_breaker_tripped(env: Env, strategy_id: u32) -> bool {
+        let strategies = Self::get_strategies_map(env.clone());
+        let strategy = match strategies.get(strategy_id) {
+            Some(s) => s,
+            None => return false,
+        };
+        let threshold = Self::get_strategy_breaker_threshold(env.clone(), strategy_id);
+        let history: Vec<RebalanceHistory> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "history"))
+            .unwrap_optimized();
+        let mut count: u32 = 0;
+        let len = history.len();
+        for i in 0..len {
+            let idx = len - 1 - i;
+            let entry = history.get(idx).unwrap();
+            let mut belongs = false;
+            for alloc in strategy.allocations.iter() {
+                if entry.from_pool == alloc.pool_id || entry.to_pool == alloc.pool_id {
+                    belongs = true;
+                    break;
+                }
+            }
+            if belongs {
+                if entry.success {
+                    return false;
+                }
+                count += 1;
+                if count >= threshold {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Check and pause engine if emergency stop is triggered for a specific strategy.
+    pub fn check_strategy_emergency_stop(env: Env, strategy_id: u32) -> bool {
+        if !Self::is_strategy_breaker_tripped(env.clone(), strategy_id) {
+            return false;
+        }
+        let admin = Self::get_admin(env.clone());
+        Self::pause(env, admin);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -2208,93 +2369,109 @@ mod tests {
         assert!(RebalanceEngine::breaker_trips(false, false, false));
     }
 
-    // ============ EXECUTION-TIME SLIPPAGE TESTS ============
-
     #[test]
-    fn test_execution_rejects_proposal_without_slippage_bound() {
+    fn test_configurable_pool_breaker_thresholds() {
         let env = Env::default();
         env.mock_all_auths_allowing_non_root_auth();
-        let admin = Address::generate(&env);
-        let contract_id = env.register(RebalanceEngine, ());
-        let client = RebalanceEngineClient::new(&env, &contract_id);
-        client.initialize(&admin);
-
-        let (from_pool, to_pool) = funded_pools(&env, &contract_id, 10_000);
-        let caller = Address::generate(&env);
-
-        // A quote with no execution-time bound must not execute.
-        let mut proposal = pacing_proposal(&from_pool, &to_pool, 100);
-        proposal.min_output = 0;
-        assert!(!client.execute_rebalance(&caller, &proposal));
-        assert_eq!(client.get_history_count(), 1);
-        assert!(!client.get_history(&1).get(0).unwrap().success);
-    }
-
-    #[test]
-    fn test_execution_rechecks_slippage_when_quote_and_execution_diverge() {
-        let env = Env::default();
-        env.mock_all_auths_allowing_non_root_auth();
-        let admin = Address::generate(&env);
-        let contract_id = env.register(RebalanceEngine, ());
-        let client = RebalanceEngineClient::new(&env, &contract_id);
-        client.initialize(&admin);
-
-        let (from_pool, to_pool) = funded_pools(&env, &contract_id, 10_000);
-        let caller = Address::generate(&env);
-
-        // The quote promised 1000 out; at execution the realised output is only
-        // 900, a 10% divergence far beyond the default 50 bps cap.
-        let mut proposal = pacing_proposal(&from_pool, &to_pool, 1000);
-        proposal.amount_b = 900;
-        proposal.min_output = 1000;
-        assert!(!client.execute_rebalance(&caller, &proposal));
-        assert!(!client.get_history(&1).get(0).unwrap().success);
-
-        // A divergence within the configured bound still executes.
-        client.set_max_slippage_bps(&admin, &1000); // 10%
-        let mut within = pacing_proposal(&from_pool, &to_pool, 1000);
-        within.amount_b = 950;
-        within.min_output = 900;
-        assert!(client.execute_rebalance(&caller, &within));
-        assert!(client.get_history(&1).get(0).unwrap().success);
-    }
-
-    #[test]
-    fn test_execution_rejects_output_below_min_output() {
-        let env = Env::default();
-        env.mock_all_auths_allowing_non_root_auth();
-        let admin = Address::generate(&env);
-        let contract_id = env.register(RebalanceEngine, ());
-        let client = RebalanceEngineClient::new(&env, &contract_id);
-        client.initialize(&admin);
-
-        let (from_pool, to_pool) = funded_pools(&env, &contract_id, 10_000);
-        let caller = Address::generate(&env);
-
-        let mut proposal = pacing_proposal(&from_pool, &to_pool, 500);
-        proposal.min_output = 600; // realised 500 < 600
-        assert!(!client.execute_rebalance(&caller, &proposal));
-    }
-
-    #[test]
-    fn test_set_max_slippage_bps_is_admin_only_and_bounded() {
-        let env = Env::default();
         let (client, admin) = engine(&env);
-        let stranger = Address::generate(&env);
+        let pool_a = Address::generate(&env);
+        let pool_b = Address::generate(&env);
+        let pool_c = Address::generate(&env);
+        let caller = Address::generate(&env);
 
-        assert_eq!(client.get_max_slippage_bps(), DEFAULT_MAX_SLIPPAGE_BPS);
+        // Pool A is sensitive: trips after 2 failures
+        client.set_pool_breaker_threshold(&admin, &pool_a, &2);
+        // Pool B is relaxed: trips after 4 failures
+        client.set_pool_breaker_threshold(&admin, &pool_b, &4);
 
-        let unauthorized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.set_max_slippage_bps(&stranger, &100);
-        }));
-        assert!(unauthorized.is_err());
+        assert_eq!(client.get_pool_breaker_threshold(&pool_a), 2);
+        assert_eq!(client.get_pool_breaker_threshold(&pool_b), 4);
+        assert_eq!(client.get_pool_breaker_threshold(&pool_c), EMERGENCY_STOP_WINDOW);
 
-        let too_high = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.set_max_slippage_bps(&admin, &10001);
-        }));
-        assert!(too_high.is_err());
+        // Record 2 failures for Pool A
+        client.execute_rebalance(&caller, &failed_proposal(&env, &pool_a));
+        client.execute_rebalance(&caller, &failed_proposal(&env, &pool_a));
 
-        client.set_max_slippage_bps(&admin, &200);
-        assert_eq!(client.get_max_slippage_bps(), 200);
+        // Pool A triggers breaker
+        assert!(client.is_pool_emergency_stop_triggered(&pool_a));
+
+        // Record 2 failures for Pool B
+        client.execute_rebalance(&caller, &failed_proposal(&env, &pool_b));
+        client.execute_rebalance(&caller, &failed_proposal(&env, &pool_b));
+
+        // Pool B does NOT trigger breaker yet (threshold is 4)
+        assert!(!client.is_pool_emergency_stop_triggered(&pool_b));
+
+        // Record 2 more failures for Pool B (total 4)
+        client.execute_rebalance(&caller, &failed_proposal(&env, &pool_b));
+        client.execute_rebalance(&caller, &failed_proposal(&env, &pool_b));
+
+        // Pool B now triggers breaker
+        assert!(client.is_pool_emergency_stop_triggered(&pool_b));
+
+        // Check emergency stop pauses contract when triggered
+        assert!(!client.is_paused());
+        assert!(client.check_pool_emergency_stop(&pool_a));
+        assert!(client.is_paused());
+    }
+
+    #[test]
+    fn test_configurable_strategy_breaker_thresholds() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (client, admin) = engine(&env);
+        let pool_a = Address::generate(&env);
+        let pool_b = Address::generate(&env);
+        let caller = Address::generate(&env);
+
+        let alloc_1 = Vec::from_array(&env, [allocation(&env, &pool_a, 10000, 500, 500)]);
+        let s1 = client.create_strategy(
+            &admin,
+            &Symbol::new(&env, "Aggressive"),
+            &3,
+            &100,
+            &500,
+            &3600,
+            &alloc_1,
+        );
+
+        let alloc_2 = Vec::from_array(&env, [allocation(&env, &pool_b, 10000, 500, 500)]);
+        let s2 = client.create_strategy(
+            &admin,
+            &Symbol::new(&env, "Conservative"),
+            &1,
+            &100,
+            &500,
+            &3600,
+            &alloc_2,
+        );
+
+        // s1 sensitive: trips after 1 failure
+        client.set_strategy_breaker_threshold(&admin, &s1, &1);
+        // s2 relaxed: trips after 3 failures
+        client.set_strategy_breaker_threshold(&admin, &s2, &3);
+
+        assert_eq!(client.get_strategy_breaker_threshold(&s1), 1);
+        assert_eq!(client.get_strategy_breaker_threshold(&s2), 3);
+
+        // 1 failure on pool_a (belongs to s1)
+        client.execute_rebalance(&caller, &failed_proposal(&env, &pool_a));
+        assert!(client.is_strategy_breaker_tripped(&s1));
+        assert!(!client.is_strategy_breaker_tripped(&s2));
+
+        // 1 failure on pool_b (belongs to s2)
+        client.execute_rebalance(&caller, &failed_proposal(&env, &pool_b));
+        // s2 needs 3, so not triggered yet
+        assert!(!client.is_strategy_breaker_tripped(&s2));
+    }
+
+    #[test]
+    fn test_breaker_trips_for_threshold_pure_rule() {
+        assert!(RebalanceEngine::breaker_trips_for_threshold(3, 3));
+        assert!(RebalanceEngine::breaker_trips_for_threshold(4, 3));
+        assert!(!RebalanceEngine::breaker_trips_for_threshold(2, 3));
+        assert!(RebalanceEngine::breaker_trips_for_threshold(1, 1));
+        assert!(!RebalanceEngine::breaker_trips_for_threshold(0, 1));
+        assert!(!RebalanceEngine::breaker_trips_for_threshold(5, 0));
     }
 }

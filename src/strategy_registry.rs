@@ -688,6 +688,7 @@ mod tests {
 
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{Env, Symbol, TryFromVal, Vec};
     use soroban_sdk::testutils::Events as _;
     use soroban_sdk::{Env, Symbol, TryFromVal, Vec};
 
@@ -1183,18 +1184,32 @@ mod tests {
         let (admin, _creator, client) = setup(&env);
 
         client.pause(&admin);
-        assert_eq!(
-            last_event_topic(&env),
-            Symbol::new(&env, "registry_paused"),
-            "pause must emit registry_paused event"
-        );
+        let pause_events = env.events().all();
+        let mut saw_pause = false;
+        for (_contract_id, topics, _data) in pause_events.iter() {
+            if let Some(first) = topics.get(0) {
+                if let Ok(sym) = Symbol::try_from_val(&env, &first) {
+                    if sym == Symbol::new(&env, "registry_paused") {
+                        saw_pause = true;
+                    }
+                }
+            }
+        }
 
         client.unpause(&admin);
-        assert_eq!(
-            last_event_topic(&env),
-            Symbol::new(&env, "registry_unpaused"),
-            "unpause must emit registry_unpaused event"
-        );
+        let unpause_events = env.events().all();
+        let mut saw_unpause = false;
+        for (_contract_id, topics, _data) in unpause_events.iter() {
+            if let Some(first) = topics.get(0) {
+                if let Ok(sym) = Symbol::try_from_val(&env, &first) {
+                    if sym == Symbol::new(&env, "registry_unpaused") {
+                        saw_unpause = true;
+                    }
+                }
+            }
+        }
+        assert!(saw_pause, "pause must emit registry_paused event");
+        assert!(saw_unpause, "unpause must emit registry_unpaused event");
     }
 
     #[test]

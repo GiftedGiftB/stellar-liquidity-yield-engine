@@ -44,6 +44,10 @@ mod reward_distributor;
 mod strategy_registry;
 #[cfg(any(feature = "yield-vault", feature = "rebalance-engine"))]
 mod yield_vault;
+#[cfg(feature = "oracle-registry")]
+mod oracle_registry;
+#[cfg(feature = "risk-engine")]
+mod risk_engine;
 
 #[cfg(feature = "actuary")]
 pub use actuary::*;
@@ -57,6 +61,10 @@ pub use reward_distributor::*;
 pub use strategy_registry::*;
 #[cfg(feature = "yield-vault")]
 pub use yield_vault::*;
+#[cfg(feature = "oracle-registry")]
+pub use oracle_registry::*;
+#[cfg(feature = "risk-engine")]
+pub use risk_engine::*;
 
 #[cfg(feature = "engine")]
 #[contract]
