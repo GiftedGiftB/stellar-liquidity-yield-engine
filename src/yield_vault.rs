@@ -1,7 +1,56 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token::TokenClient, unwrap::UnwrapOptimized, Address,
-    Env, Map, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token::TokenClient,
+    Address, Env, Map, Symbol, Vec,
 };
+
+/// Typed failures of the yield vault.
+///
+/// Anticipated invalid inputs - a caller who is not the admin, a deposit below
+/// the configured minimum, a withdrawal that would redeem nothing - fail with
+/// one of these codes instead of an opaque string panic. A caller (or an
+/// off-chain client) can therefore tell the cases apart and handle them.
+#[contracterror]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VaultError {
+    /// The caller is not the stored admin.
+    Unauthorized = 1,
+    /// The vault is paused and refuses state-changing operations.
+    Paused = 2,
+    /// The vault has not been initialized, so its configuration is missing.
+    NotInitialized = 3,
+    /// A deposit leg is below the configured minimum.
+    AmountBelowMinimum = 4,
+    /// Both deposit legs are zero.
+    DepositMustBePositive = 5,
+    /// The deposit is too small: it would mint zero shares.
+    DepositTooSmall = 6,
+    /// The deposit minted fewer shares than the caller's `min_shares`.
+    InsufficientSharesReceived = 7,
+    /// The requested share amount is not positive.
+    SharesMustBePositive = 8,
+    /// The requested withdrawal is below the configured minimum shares.
+    WithdrawalBelowMinimum = 9,
+    /// The caller holds fewer shares than the withdrawal asks for.
+    InsufficientShares = 10,
+    /// The vault has no shares outstanding, so there is nothing to price against.
+    NoSharesOutstanding = 11,
+    /// A partial withdrawal would redeem zero tokens.
+    WithdrawalTooSmall = 12,
+    /// The redeemed token A is below the caller's `min_amount_a`.
+    InsufficientAmountA = 13,
+    /// The redeemed token B is below the caller's `min_amount_b`.
+    InsufficientAmountB = 14,
+    /// A configured minimum deposit amount is negative.
+    NegativeMinimumDeposit = 15,
+    /// The configured minimum withdrawal must be positive.
+    MinSharesMustBePositive = 16,
+    /// A configured token price is negative.
+    NegativePrice = 17,
+    /// The emergency multisig threshold must be at least 1.
+    ThresholdMustBePositive = 18,
+    /// Fewer authorized emergency signers than the threshold were supplied.
+    InsufficientEmergencySignatures = 19,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -231,9 +280,13 @@ impl YieldVault {
         // Reject sub-unit and zero deposits before any tokens move, so a dust
         // deposit can never be used to grief the vault or other depositors.
         let (min_a, min_b) = Self::get_min_deposit_amounts(env.clone());
-        require!(amount_a >= min_a, "amount_a below minimum deposit");
-        require!(amount_b >= min_b, "amount_b below minimum deposit");
-        require!(amount_a + amount_b > 0, "deposit must be positive");
+        require!(&env, amount_a >= min_a, VaultError::AmountBelowMinimum);
+        require!(&env, amount_b >= min_b, VaultError::AmountBelowMinimum);
+        require!(
+            &env,
+            amount_a + amount_b > 0,
+            VaultError::DepositMustBePositive
+        );
 
         let vault_info = Self::get_vault_info(env.clone());
         let mut metrics = Self::get_metrics(env.clone());
@@ -261,10 +314,10 @@ impl YieldVault {
 
         // A deposit that rounds down to nothing would be a pure donation, so it
         // is rejected instead of silently credited to existing holders.
-        require!(shares > 0, "deposit too small: mints zero shares");
+        require!(&env, shares > 0, VaultError::DepositTooSmall);
 
         if shares < min_shares {
-            panic!("insufficient shares received");
+            panic_with_error!(&env, VaultError::InsufficientSharesReceived);
         }
 
         // Update user position
@@ -306,10 +359,11 @@ impl YieldVault {
         // Reject zero-share and sub-unit withdrawals before any arithmetic, which
         // also removes the divide-by-zero path when no shares are outstanding.
         let min_withdraw_shares = Self::get_min_withdraw_shares(env.clone());
-        require!(shares > 0, "shares must be positive");
+        require!(&env, shares > 0, VaultError::SharesMustBePositive);
         require!(
+            &env,
             shares >= min_withdraw_shares,
-            "withdrawal below minimum shares"
+            VaultError::WithdrawalBelowMinimum
         );
 
         let vault_info = Self::get_vault_info(env.clone());
@@ -317,10 +371,14 @@ impl YieldVault {
         let mut position = Self::get_user_position(env.clone(), user.clone());
 
         if position.shares < shares {
-            panic!("insufficient shares");
+            panic_with_error!(&env, VaultError::InsufficientShares);
         }
 
-        require!(metrics.total_shares > 0, "no shares outstanding");
+        require!(
+            &env,
+            metrics.total_shares > 0,
+            VaultError::NoSharesOutstanding
+        );
 
         // Calculate withdrawal amounts
         let is_full_exit = shares == position.shares;
@@ -342,8 +400,9 @@ impl YieldVault {
             // A partial exit has to redeem something, otherwise the shares would
             // round-trip to dust.
             require!(
+                &env,
                 withdraw_amount_a > 0 || withdraw_amount_b > 0,
-                "withdrawal too small: redeems zero tokens"
+                VaultError::WithdrawalTooSmall
             );
         }
 
@@ -371,10 +430,10 @@ impl YieldVault {
         let final_amount_b = withdraw_amount_b - fee_amount_b - perf_fee_b;
 
         if final_amount_a < min_amount_a {
-            panic!("insufficient amount A");
+            panic_with_error!(&env, VaultError::InsufficientAmountA);
         }
         if final_amount_b < min_amount_b {
-            panic!("insufficient amount B");
+            panic_with_error!(&env, VaultError::InsufficientAmountB);
         }
 
         // Pace large exits before any tokens move: a failure here rolls the
@@ -557,8 +616,8 @@ impl YieldVault {
         min_b: i128,
     ) -> u64 {
         Self::require_admin(&env, admin.clone());
-        require!(min_a >= 0, "min_amount_a must not be negative");
-        require!(min_b >= 0, "min_amount_b must not be negative");
+        require!(&env, min_a >= 0, VaultError::NegativeMinimumDeposit);
+        require!(&env, min_b >= 0, VaultError::NegativeMinimumDeposit);
 
         Self::enqueue(
             env,
@@ -581,7 +640,7 @@ impl YieldVault {
     /// Returns the id of the queued action.
     pub fn propose_set_min_withdraw_shares(env: Env, admin: Address, min_shares: i128) -> u64 {
         Self::require_admin(&env, admin.clone());
-        require!(min_shares > 0, "min_shares must be positive");
+        require!(&env, min_shares > 0, VaultError::MinSharesMustBePositive);
 
         Self::enqueue(
             env,
@@ -662,11 +721,13 @@ impl YieldVault {
     }
 
     /// Get vault information
+    ///
+    /// Fails with [`VaultError::NotInitialized`] before `initialize` has run.
     pub fn get_vault_info(env: Env) -> VaultInfo {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "vault_info"))
-            .unwrap_optimized()
+            .unwrap_or_else(|| env.panic_with_error(VaultError::NotInitialized))
     }
 
     /// Get vault metrics, recomputing TVL on the fly from the current balances
@@ -698,6 +759,30 @@ impl YieldVault {
         Self::get_metrics(env).tvl
     }
 
+    /// Set USD prices (scaled) for token_a and token_b (admin only). TVL is
+    /// recomputed immediately so get_tvl reflects the new prices.
+    pub fn set_prices(env: Env, admin: Address, price_a: i128, price_b: i128) {
+        let current_admin = Self::get_admin(env.clone());
+        if admin != current_admin {
+            panic_with_error!(&env, VaultError::Unauthorized);
+        }
+        if price_a < 0 || price_b < 0 {
+            panic_with_error!(&env, VaultError::NegativePrice);
+        }
+
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "price_a"), &price_a);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "price_b"), &price_b);
+
+        let metrics = Self::get_metrics(env.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "metrics"), &metrics);
+    }
+
     /// Queue a change to the USD prices (scaled) used for TVL (admin only).
     ///
     /// Prices are an economic parameter: they change the value backing every
@@ -716,11 +801,13 @@ impl YieldVault {
     }
 
     /// Get treasury address that receives protocol fees
+    ///
+    /// Fails with [`VaultError::NotInitialized`] before `initialize` has run.
     pub fn get_treasury(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "treasury"))
-            .unwrap_or_else(|| panic!("treasury not configured"))
+            .unwrap_or_else(|| env.panic_with_error(VaultError::NotInitialized))
     }
 
     /// Queue a change to the treasury/DAO address that receives protocol fees
@@ -1083,11 +1170,13 @@ impl YieldVault {
     }
 
     /// Get admin address
+    ///
+    /// Fails with [`VaultError::NotInitialized`] before `initialize` has run.
     fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| panic!("admin not configured"))
+            .unwrap_or_else(|| env.panic_with_error(VaultError::NotInitialized))
     }
 
     /// Check if vault is paused
@@ -1101,7 +1190,7 @@ impl YieldVault {
     /// Require vault not paused
     fn require_not_paused(env: &Env) {
         if Self::is_paused(env.clone()) {
-            panic!("vault is paused");
+            env.panic_with_error(VaultError::Paused);
         }
     }
 
@@ -1109,7 +1198,7 @@ impl YieldVault {
     pub fn pause(env: Env, admin: Address) {
         let current_admin = Self::get_admin(env.clone());
         if admin != current_admin {
-            panic!("unauthorized");
+            panic_with_error!(&env, VaultError::Unauthorized);
         }
         env.storage()
             .instance()
@@ -1122,7 +1211,7 @@ impl YieldVault {
     pub fn unpause(env: Env, admin: Address) {
         let current_admin = Self::get_admin(env.clone());
         if admin != current_admin {
-            panic!("unauthorized");
+            panic_with_error!(&env, VaultError::Unauthorized);
         }
         env.storage()
             .instance()
@@ -1135,7 +1224,7 @@ impl YieldVault {
     fn require_admin(env: &Env, caller: Address) {
         let admin = Self::get_admin(env.clone());
         if caller != admin {
-            panic!("unauthorized");
+            env.panic_with_error(VaultError::Unauthorized);
         }
     }
 
@@ -1155,7 +1244,7 @@ impl YieldVault {
     pub fn set_emergency_threshold(env: Env, admin: Address, threshold: u32) {
         Self::require_admin(&env, admin);
         if threshold == 0 {
-            panic!("threshold must be at least 1");
+            panic_with_error!(&env, VaultError::ThresholdMustBePositive);
         }
         env.storage()
             .instance()
@@ -1195,7 +1284,7 @@ impl YieldVault {
         }
 
         if valid < threshold {
-            panic!("insufficient signatures for emergency action");
+            env.panic_with_error(VaultError::InsufficientEmergencySignatures);
         }
     }
 
@@ -2059,6 +2148,122 @@ mod tests {
             position.last_harvest, 0,
             "a caller with no position must not get a harvest timestamp written"
         );
+    }
+
+    // ==================== Typed error paths ====================
+
+    #[test]
+    fn test_deposit_reports_typed_errors() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _ta, _tb, _ta_admin, _tb_admin, user, admin, _) = setup(&env, 0, 0, 0);
+
+        // Both legs zero.
+        let err = vault.try_deposit(&user, &0, &0, &0).unwrap_err().unwrap();
+        assert_eq!(err, VaultError::DepositMustBePositive.into());
+
+        // A negative leg trips the per-leg minimum check first.
+        let err = vault.try_deposit(&user, &-1, &0, &0).unwrap_err().unwrap();
+        assert_eq!(err, VaultError::AmountBelowMinimum.into());
+
+        // A positive deposit below the configured minimum for one leg. The
+        // minimum is an economic parameter, so it moves through the timelock.
+        let action = vault.propose_set_min_deposit_amounts(&admin, &10, &0);
+        env.ledger().set_timestamp(DEFAULT_TIMELOCK_DELAY + 1);
+        vault.execute_pending_action(&admin, &action);
+        let err = vault.try_deposit(&user, &5, &0, &0).unwrap_err().unwrap();
+        assert_eq!(err, VaultError::AmountBelowMinimum.into());
+    }
+
+    #[test]
+    fn test_withdraw_reports_typed_errors() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _ta, _tb, ta_admin, tb_admin, user, admin, _) = setup(&env, 0, 0, 0);
+        ta_admin.mint(&user, &1_000);
+        tb_admin.mint(&user, &1_000);
+        vault.deposit(&user, &500, &500, &0);
+
+        // Zero shares.
+        let err = vault.try_withdraw(&user, &0, &0, &0).unwrap_err().unwrap();
+        assert_eq!(err, VaultError::SharesMustBePositive.into());
+
+        // More shares than held.
+        let err = vault
+            .try_withdraw(&user, &10_000, &0, &0)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VaultError::InsufficientShares.into());
+
+        // Min shares below the configured withdrawal minimum; same timelock
+        // path as every other economic parameter.
+        let action = vault.propose_set_min_withdraw_shares(&admin, &100);
+        env.ledger().set_timestamp(DEFAULT_TIMELOCK_DELAY + 1);
+        vault.execute_pending_action(&admin, &action);
+        let err = vault.try_withdraw(&user, &50, &0, &0).unwrap_err().unwrap();
+        assert_eq!(err, VaultError::WithdrawalBelowMinimum.into());
+    }
+
+    #[test]
+    fn test_admin_setters_report_typed_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _ta, _tb, _ta_admin, _tb_admin, _user, _admin, _) = setup(&env, 0, 0, 0);
+
+        let stranger = Address::generate(&env);
+        let err = vault
+            .try_propose_set_min_deposit_amounts(&stranger, &10, &10)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VaultError::Unauthorized.into());
+
+        let err = vault.try_pause(&stranger).unwrap_err().unwrap();
+        assert_eq!(err, VaultError::Unauthorized.into());
+    }
+
+    #[test]
+    fn test_set_prices_reports_typed_errors() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _ta, _tb, _ta_admin, _tb_admin, _user, admin, _) = setup(&env, 0, 0, 0);
+
+        let err = vault.try_set_prices(&admin, &-1, &1).unwrap_err().unwrap();
+        assert_eq!(err, VaultError::NegativePrice.into());
+
+        let err = vault.try_set_prices(&admin, &1, &-1).unwrap_err().unwrap();
+        assert_eq!(err, VaultError::NegativePrice.into());
+    }
+
+    #[test]
+    fn test_paused_vault_rejects_deposit_with_typed_error() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _ta, _tb, ta_admin, _tb_admin, user, admin, _) = setup(&env, 0, 0, 0);
+        ta_admin.mint(&user, &1_000);
+
+        vault.pause(&admin);
+        let err = vault.try_deposit(&user, &100, &0, &0).unwrap_err().unwrap();
+        assert_eq!(err, VaultError::Paused.into());
+    }
+
+    #[test]
+    fn test_emergency_unpause_requires_enough_signatures() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _ta, _tb, _ta_admin, _tb_admin, _user, admin, _) = setup(&env, 0, 0, 0);
+
+        let s1 = Address::generate(&env);
+        let s2 = Address::generate(&env);
+        vault.set_emergency_signers(&admin, &Vec::from_array(&env, [s1.clone(), s2.clone()]));
+        vault.set_emergency_threshold(&admin, &2);
+        vault.emergency_pause(&Vec::from_array(&env, [s1.clone(), s2.clone()]));
+
+        // Only one of the two required signers.
+        let err = vault
+            .try_emergency_unpause(&Vec::from_array(&env, [s1]))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VaultError::InsufficientEmergencySignatures.into());
     }
 
     // ─── Insurance Integration ────────────────────────────────────────────────

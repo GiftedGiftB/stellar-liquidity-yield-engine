@@ -1,7 +1,36 @@
 use soroban_sdk::token::TokenClient;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, unwrap::UnwrapOptimized, Address, Env, Map, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, Map,
+    Symbol, Vec,
 };
+
+/// Typed failures of the rebalance engine.
+///
+/// Expected invalid inputs - an out-of-range risk level, a strategy id that
+/// does not exist, an unauthorized keeper - fail with one of these codes so a
+/// caller can distinguish and handle them instead of parsing a panic message.
+#[contracterror]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RebalanceError {
+    /// The caller is neither the admin nor a configured APY keeper.
+    Unauthorized = 1,
+    /// The engine is paused and refuses the operation.
+    Paused = 2,
+    /// The engine has not been initialized.
+    NotInitialized = 3,
+    /// No strategy exists with the requested id.
+    StrategyNotFound = 4,
+    /// `risk_level` must be 1 (conservative), 2 (balanced) or 3 (aggressive).
+    InvalidRiskLevel = 5,
+    /// The allocations list was empty.
+    EmptyAllocations = 6,
+    /// A single allocation exceeds 10000 bps (100%).
+    AllocationOutOfRange = 7,
+    /// The allocations do not sum to exactly 10000 bps (100%).
+    AllocationsMustSumTo100Percent = 8,
+    /// The published APY exceeds [`MAX_APY_BPS`].
+    ApyOutOfRange = 9,
+}
 
 /// The single vault call this engine makes.
 ///
@@ -258,7 +287,7 @@ impl RebalanceEngine {
     ) -> u32 {
         Self::require_admin(&env, admin.clone());
         Self::require_not_paused(&env);
-        Self::validate_allocations(&allocations);
+        Self::validate_allocations(&env, &allocations);
 
         let strategy_id = Self::get_next_strategy_id(&env);
 
@@ -273,7 +302,11 @@ impl RebalanceEngine {
         };
 
         let mut strategies = Self::get_strategies_map(env.clone());
-        require!((1..=3).contains(&risk_level), "risk_level must be 1-3");
+        require!(
+            env,
+            (1..=3).contains(&risk_level),
+            RebalanceError::InvalidRiskLevel
+        );
         strategies.set(strategy_id, strategy.clone());
         env.storage()
             .instance()
@@ -301,12 +334,16 @@ impl RebalanceEngine {
     ) {
         Self::require_admin(&env, admin.clone());
         Self::require_not_paused(&env);
-        Self::validate_allocations(&allocations);
-        require!((1..=3).contains(&risk_level), "risk_level must be 1-3");
+        Self::validate_allocations(&env, &allocations);
+        require!(
+            env,
+            (1..=3).contains(&risk_level),
+            RebalanceError::InvalidRiskLevel
+        );
 
         let mut strategies = Self::get_strategies_map(env.clone());
         if strategies.get(strategy_id).is_none() {
-            panic!("strategy not found");
+            panic_with_error!(&env, RebalanceError::StrategyNotFound);
         }
         let updated_strategy = RebalanceStrategy {
             strategy_id,
@@ -477,30 +514,38 @@ impl RebalanceEngine {
 
     /// Validate that allocations are non-empty, each within bounds (<= 10000 bps),
     /// and that the percentages sum to exactly 10000 bps (100%).
-    fn validate_allocations(allocations: &Vec<PoolAllocation>) {
-        require!(!allocations.is_empty(), "allocations must not be empty");
+    fn validate_allocations(env: &Env, allocations: &Vec<PoolAllocation>) {
+        require!(
+            env,
+            !allocations.is_empty(),
+            RebalanceError::EmptyAllocations
+        );
 
         let mut total_bps: u64 = 0;
         for allocation in allocations.iter() {
             require!(
+                env,
                 allocation.allocation_percent <= 10000,
-                "allocation_percent must not exceed 10000 bps (100%)"
+                RebalanceError::AllocationOutOfRange
             );
             total_bps += allocation.allocation_percent as u64;
         }
 
         require!(
+            env,
             total_bps == 10000,
-            "allocations must sum to exactly 10000 bps (100%)"
+            RebalanceError::AllocationsMustSumTo100Percent
         );
     }
 
     /// Internal: get strategies Map for O(1) access
+    ///
+    /// Fails with [`RebalanceError::NotInitialized`] before `initialize` runs.
     pub fn get_strategies_map(env: Env) -> Map<u32, RebalanceStrategy> {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "strategies"))
-            .unwrap_optimized()
+            .unwrap_or_else(|| env.panic_with_error(RebalanceError::NotInitialized))
     }
 
     /// Get all strategies as Vec (materialized from Map)
@@ -514,10 +559,12 @@ impl RebalanceEngine {
     }
 
     /// Get specific strategy - O(1)
+    ///
+    /// Fails with [`RebalanceError::StrategyNotFound`] for an unknown id.
     pub fn get_strategy(env: Env, strategy_id: u32) -> RebalanceStrategy {
-        Self::get_strategies_map(env)
+        Self::get_strategies_map(env.clone())
             .get(strategy_id)
-            .unwrap_or_else(|| panic!("strategy not found"))
+            .unwrap_or_else(|| env.panic_with_error(RebalanceError::StrategyNotFound))
     }
 
     /// Paginated strategy listing (Issue #107)
@@ -549,7 +596,7 @@ impl RebalanceEngine {
             .storage()
             .instance()
             .get(&Symbol::new(&env, "history"))
-            .unwrap_optimized();
+            .unwrap_or_else(|| env.panic_with_error(RebalanceError::NotInitialized));
 
         let mut result: Vec<RebalanceHistory> = Vec::new(&env);
         let start = if history.len() > limit {
@@ -571,7 +618,7 @@ impl RebalanceEngine {
             .storage()
             .instance()
             .get(&Symbol::new(&env, "history"))
-            .unwrap_optimized();
+            .unwrap_or_else(|| env.panic_with_error(RebalanceError::NotInitialized));
         if limit == 0 || offset >= history.len() {
             return Vec::new(&env);
         }
@@ -588,7 +635,7 @@ impl RebalanceEngine {
             .storage()
             .instance()
             .get(&Symbol::new(&env, "history"))
-            .unwrap_optimized();
+            .unwrap_or_else(|| env.panic_with_error(RebalanceError::NotInitialized));
         h.len()
     }
 
@@ -608,6 +655,7 @@ impl RebalanceEngine {
     pub fn update_pool_apy(env: Env, caller: Address, pool_id: Address, apy_bps: u32) {
         Self::require_not_paused(&env);
         Self::require_admin_or_apy_keeper(&env, caller.clone());
+        require!(env, apy_bps <= MAX_APY_BPS, RebalanceError::ApyOutOfRange);
         require!(apy_bps <= MAX_APY_BPS, "apy_bps exceeds maximum");
         // The caller address is part of the feed's public provenance, so it
         // must be authorized by that address rather than merely supplied as a
@@ -1056,7 +1104,7 @@ impl RebalanceEngine {
             .storage()
             .instance()
             .get(&Symbol::new(env, "next_strategy_id"))
-            .unwrap_optimized();
+            .unwrap_or_else(|| env.panic_with_error(RebalanceError::NotInitialized));
         env.storage()
             .instance()
             .set(&Symbol::new(env, "next_strategy_id"), &(id + 1));
@@ -1171,7 +1219,7 @@ impl RebalanceEngine {
             .storage()
             .instance()
             .get(&Symbol::new(env, "history"))
-            .unwrap_optimized();
+            .unwrap_or_else(|| env.panic_with_error(RebalanceError::NotInitialized));
 
         history.push_back(entry);
 
@@ -1192,16 +1240,17 @@ impl RebalanceEngine {
         }
     }
 
+    /// Admin address, or [`RebalanceError::NotInitialized`] before `initialize`.
     fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| panic!("admin not configured"))
+            .unwrap_or_else(|| env.panic_with_error(RebalanceError::NotInitialized))
     }
 
     fn require_admin(env: &Env, caller: Address) {
         let admin = Self::get_admin(env.clone());
-        require!(caller == admin, "unauthorized: admin required");
+        require!(env, caller == admin, RebalanceError::Unauthorized);
     }
 
     /// Allow the admin or any configured APY keeper to push oracle data.
@@ -1223,7 +1272,7 @@ impl RebalanceEngine {
             }
         }
 
-        panic!("unauthorized: admin or apy keeper required");
+        panic_with_error!(env, RebalanceError::Unauthorized);
     }
 
     /// Whether the engine is paused.
@@ -1243,8 +1292,8 @@ impl RebalanceEngine {
     }
 
     fn require_not_paused(env: &Env) {
-        if Self::paused(env.clone()) {
-            panic!("rebalance engine is paused");
+        if Self::is_paused(env.clone()) {
+            env.panic_with_error(RebalanceError::Paused);
         }
     }
 
@@ -2176,6 +2225,93 @@ mod tests {
         assert!(opportunity.recommended);
     }
 
+    // ==================== Typed error paths ====================
+
+    #[test]
+    fn test_create_strategy_reports_typed_errors() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (client, admin) = engine(&env);
+
+        // Empty allocations.
+        let empty: Vec<PoolAllocation> = Vec::new(&env);
+        let err = client
+            .try_create_strategy(
+                &admin,
+                &Symbol::new(&env, "Empty"),
+                &1,
+                &100,
+                &500,
+                &3600,
+                &empty,
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RebalanceError::EmptyAllocations.into());
+
+        // A single allocation above 100%.
+        let pool = Address::generate(&env);
+        let over = Vec::from_array(&env, [allocation(&env, &pool, 10001, 500, 500)]);
+        let err = client
+            .try_create_strategy(
+                &admin,
+                &Symbol::new(&env, "Over"),
+                &1,
+                &100,
+                &500,
+                &3600,
+                &over,
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RebalanceError::AllocationOutOfRange.into());
+
+        // Allocations that do not sum to 100%.
+        let short = Vec::from_array(
+            &env,
+            [
+                allocation(&env, &pool, 4000, 500, 500),
+                allocation(&env, &Address::generate(&env), 4000, 500, 500),
+            ],
+        );
+        let err = client
+            .try_create_strategy(
+                &admin,
+                &Symbol::new(&env, "Short"),
+                &1,
+                &100,
+                &500,
+                &3600,
+                &short,
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RebalanceError::AllocationsMustSumTo100Percent.into());
+
+        // Risk level outside 1..=3.
+        let ok = Vec::from_array(&env, [allocation(&env, &pool, 10000, 500, 500)]);
+        let err = client
+            .try_create_strategy(
+                &admin,
+                &Symbol::new(&env, "BadRisk"),
+                &9,
+                &100,
+                &500,
+                &3600,
+                &ok,
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RebalanceError::InvalidRiskLevel.into());
+    }
+
+    #[test]
+    fn test_get_strategy_unknown_id_is_typed() {
+        let env = Env::default();
+        let (client, _admin) = engine(&env);
+
+        let err = client.try_get_strategy(&7).unwrap_err().unwrap();
+        assert_eq!(err, RebalanceError::StrategyNotFound.into());
     // ============ REBALANCE PACING TESTS (Issue #302) ============
 
     /// Real token contracts for a rebalance leg: the engine pulls the `from`
@@ -2321,6 +2457,31 @@ mod tests {
         assert!(!client.is_emergency_stop_triggered());
         assert!(!client.check_emergency_stop());
         assert!(!client.is_paused(), "a new engine must not stop itself");
+    }
+
+    #[test]
+    fn test_non_admin_pause_is_typed_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (client, _admin) = engine(&env);
+
+        let stranger = Address::generate(&env);
+        let err = client.try_pause(&stranger).unwrap_err().unwrap();
+        assert_eq!(err, RebalanceError::Unauthorized.into());
+    }
+
+    #[test]
+    fn test_published_apy_above_maximum_is_typed() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (client, admin) = engine(&env);
+
+        let pool = Address::generate(&env);
+        let err = client
+            .try_update_pool_apy(&admin, &pool, &(MAX_APY_BPS + 1))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RebalanceError::ApyOutOfRange.into());
     }
 
     #[test]
