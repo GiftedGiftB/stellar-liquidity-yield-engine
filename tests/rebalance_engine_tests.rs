@@ -59,6 +59,8 @@ fn main() {}
 mod tests {
     use super::*;
 
+    /// Shared harness: registers the contract, initializes it with a fresh
+    /// admin, and returns a ready-to-use client plus the admin address.
     fn setup_rebalance_engine(env: &Env) -> (RebalanceEngineClient, Address) {
         let admin = Address::generate(env);
         let contract_id = env.register_contract(None, RebalanceEngine);
@@ -66,6 +68,15 @@ mod tests {
         client.initialize(&admin);
         (client, admin)
     }
+
+    fn setup_rebalance_engine(env: &Env) -> (RebalanceEngineClient, Address) {
+        let admin = Address::generate(env);
+        let contract_id = env.register_contract(None, RebalanceEngine);
+        let client = RebalanceEngineClient::new(env, &contract_id);
+        client.initialize(&admin);
+        (client, admin)
+    }
+
 
     fn create_test_strategy(env: &Env, client: &RebalanceEngineClient, admin: &Address) -> u32 {
         let token_a = Address::generate(env);
