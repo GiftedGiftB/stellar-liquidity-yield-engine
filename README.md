@@ -294,6 +294,30 @@ await bot.forceHarvest('VAULT_ADDRESS');
 - **Cooldown Periods**: Minimum time between harvests
 - **Performance Tracking**: Detailed harvest statistics
 
+### Surviving Restarts and Outages
+Keepers can checkpoint their position so a restart resumes exactly where the
+previous process stopped — no replay, no gaps. Pass a `CheckpointStore` to the
+event listener, the RPC lag monitor, and/or the auto-rebalancer:
+
+```typescript
+import { ContractEventListener, FileCheckpointStore } from 'stellar-liquidity-yield-engine-sdk';
+
+const store = new FileCheckpointStore('./state/keeper.json');
+const listener = new ContractEventListener(server, {
+  startLedger: 0,        // fallback; the checkpoint wins when present
+  store,
+});
+
+listener.start(5_000);   // restores from the checkpoint, then catches up
+```
+
+See [docs/KEEPER_RECOVERY.md](docs/KEEPER_RECOVERY.md) for the full recovery
+model and `examples/restart-during-outage.ts` for a runnable demonstration:
+
+```bash
+npx ts-node examples/restart-during-outage.ts
+```
+
 ## 🎛️ React Components
 
 ### YieldVaultCard
@@ -349,6 +373,14 @@ import { ImpermanentLossChart } from '@/components/ImpermanentLossChart';
 - **Time Locks**: Delays for sensitive operations
 - **Multi-signature**: Enhanced admin security
 - **Audit Trail**: Complete operation logging
+
+#### Swap-router slippage tolerance
+
+`max_slippage_bps` and the router's `default_slippage` are integer basis
+points (`100` = 1%). They accept values from `0` through `100` inclusive.
+Values above `100` are rejected with `InvalidSlippage`; an invalid admin update
+does not replace the previously configured value. Supplying no per-quote value
+uses the validated configured default.
 
 ## 📊 Performance Metrics
 
@@ -478,6 +510,9 @@ need, such as `STRATEGY_REGISTRY_ADDRESS` and `REWARD_DISTRIBUTOR_ADDRESS`,
 before running step 4 above).
 
 ## 🧪 Testing
+
+For reproducible randomized swap path and quote tests, including seed replay
+and known router limitations, see [Router fuzzing](docs/ROUTER_FUZZING.md).
 
 ### Unit Tests
 ```bash
