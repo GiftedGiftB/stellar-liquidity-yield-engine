@@ -52,7 +52,8 @@ class FakeChain {
       ledgerClosedAt: new Date(ledger * 5_000).toISOString(),
       topic: [topic],
       value: { ledger },
-      id: `${contractId}-${ledger}`,
+      // Unique and ordered, like the RPC's paging tokens.
+      id: `${contractId}-${ledger}-${this.events.length}`,
     });
     this.head = Math.max(this.head, ledger);
   }
@@ -70,9 +71,15 @@ class FakeChain {
       getEvents: async (request: GetEventsRequest): Promise<GetEventsResponse> => {
         this.requests.push(request);
         const limit = request.limit ?? 200;
-        const events = this.events
-          .filter((e) => e.ledger >= request.startLedger)
-          .slice(0, limit);
+        // Like Soroban RPC: a cursor resumes strictly after that event and
+        // cannot be combined with startLedger.
+        if (request.cursor !== undefined && request.startLedger !== undefined) {
+          throw new Error('startLedger and cursor cannot both be set');
+        }
+        const remaining = request.cursor !== undefined
+          ? this.events.slice(this.events.findIndex((e) => e.id === request.cursor) + 1)
+          : this.events.filter((e) => e.ledger >= (request.startLedger ?? 0));
+        const events = remaining.slice(0, limit);
         return { events, latestLedger: this.head };
       },
     };
@@ -431,5 +438,99 @@ describe('a keeper coming back after an outage', () => {
     const report = await restartedMonitor.check();
     expect(report.lagLedgers).toBe(0);
     expect(report.severity).toBe('ok');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scenario: a full page stops in the middle of a busy ledger
+// ---------------------------------------------------------------------------
+
+describe('a page that ends mid-ledger', () => {
+  /** Ledger 100 carries five events; 101 and 102 carry one each. */
+  function busyChain(): FakeChain {
+    const chain = new FakeChain();
+    for (let i = 0; i < 5; i += 1) chain.append(100, 'deposit');
+    chain.append(101, 'harvest');
+    chain.append(102, 'withdraw');
+    return chain;
+  }
+
+  function collectIds(listener: ContractEventListener): string[] {
+    const seen: string[] = [];
+    listener.onRaw((e) => seen.push(`${e.ledger}:${(e.topic as string[])[0]}`));
+    return seen;
+  }
+
+  const ALL = [
+    '100:deposit', '100:deposit', '100:deposit', '100:deposit', '100:deposit',
+    '101:harvest', '102:withdraw',
+  ];
+
+  it('delivers every event in the ledger, continuing with the RPC paging cursor', async () => {
+    const chain = busyChain();
+    const listener = new ContractEventListener(chain.source(), { startLedger: 100, pageSize: 2 });
+    const seen = collectIds(listener);
+
+    for (let i = 0; i < 5; i += 1) await listener.poll();
+
+    expect(seen).toEqual(ALL);
+    expect(chain.requests[0]).toMatchObject({ startLedger: 100 });
+    expect(chain.requests[1].cursor).toBe(chain.events[1].id);
+    expect(chain.requests[1].startLedger).toBeUndefined();
+    expect(listener.currentLedger).toBe(103);
+  });
+
+  it('persists the paging cursor so a restart resumes mid-ledger without replay or gaps', async () => {
+    const chain = busyChain();
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'listener-cursor-'));
+    const file = path.join(dir, 'listener.json');
+
+    try {
+      // Run 1 consumes one full page (two of ledger 100's five events) and dies.
+      const first = new ContractEventListener(chain.source(), {
+        startLedger: 100,
+        pageSize: 2,
+        store: new FileCheckpointStore(file),
+      });
+      const beforeCrash = collectIds(first);
+      await first.poll();
+      expect(beforeCrash).toEqual(ALL.slice(0, 2));
+
+      // Run 2 is a brand new process reading the checkpoint from disk.
+      const second = new ContractEventListener(chain.source(), {
+        startLedger: 0,
+        pageSize: 2,
+        store: new FileCheckpointStore(file),
+      });
+      const afterRestart = collectIds(second);
+      for (let i = 0; i < 4; i += 1) await second.poll();
+
+      expect([...beforeCrash, ...afterRestart]).toEqual(ALL);
+      expect(second.currentLedger).toBe(103);
+
+      // Once drained, the checkpoint no longer carries a paging cursor.
+      const saved = JSON.parse(await fs.readFile(file, 'utf8'));
+      expect(saved.nextLedger).toBe(103);
+      expect(saved.metadata?.eventCursor).toBeUndefined();
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('drops a stored paging cursor when the operator moves startLedger past it', async () => {
+    const chain = busyChain();
+    const store = new MemoryCheckpointStore();
+
+    const first = new ContractEventListener(chain.source(), { startLedger: 100, pageSize: 2, store });
+    await first.poll();
+    expect(store.peek()!.metadata?.eventCursor).toBe(chain.events[1].id);
+
+    const second = new ContractEventListener(chain.source(), { startLedger: 102, pageSize: 2, store });
+    const seen = collectIds(second);
+    await second.poll();
+
+    expect(chain.requests[1]).toMatchObject({ startLedger: 102 });
+    expect(chain.requests[1].cursor).toBeUndefined();
+    expect(seen).toEqual(['102:withdraw']);
   });
 });

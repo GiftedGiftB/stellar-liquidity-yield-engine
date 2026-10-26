@@ -67,8 +67,12 @@ class SimulatedChain {
     return {
       getEvents: async (request: GetEventsRequest): Promise<GetEventsResponse> => {
         const limit = request.limit ?? 200;
+        // A paging cursor resumes strictly after that event, as on Soroban RPC.
+        const remaining = request.cursor !== undefined
+          ? this.events.slice(this.events.findIndex((e) => e.id === request.cursor) + 1)
+          : this.events.filter((e) => e.ledger >= (request.startLedger ?? 0));
         return {
-          events: this.events.filter((e) => e.ledger >= request.startLedger).slice(0, limit),
+          events: remaining.slice(0, limit),
           latestLedger: this.head,
         };
       },

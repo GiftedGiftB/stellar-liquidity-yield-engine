@@ -59,6 +59,9 @@ import {
  */
 export const DEFAULT_PAGE_SIZE = 200;
 
+/** Checkpoint metadata key holding the RPC paging cursor mid-ledger. */
+export const EVENT_CURSOR_KEY = 'eventCursor';
+
 // ---------------------------------------------------------------------------
 // Soroban RPC surface
 // ---------------------------------------------------------------------------
@@ -101,7 +104,13 @@ export interface GetEventsFilter {
 }
 
 export interface GetEventsRequest {
-  startLedger: number;
+  /** First ledger to scan. Omitted when {@link cursor} is set. */
+  startLedger?: number;
+  /**
+   * Resume strictly after the event with this paging token. Soroban RPC
+   * rejects requests that set both `cursor` and `startLedger`.
+   */
+  cursor?: string;
   endLedger?: number;
   filters?: GetEventsFilter[];
   limit?: number;
@@ -311,6 +320,16 @@ export class ContractEventListener {
   /** Latest ledger the listener has consumed (exclusive lower bound). */
   private cursor: number;
 
+  /**
+   * RPC paging token of the last event received when a page came back full.
+   * While set, the next request resumes strictly after that event instead of
+   * at {@link cursor}, so a page that ends mid-ledger loses nothing.
+   */
+  private pagingCursor: string | null = null;
+
+  /** Tail of the poll queue; polls run one after another, never overlapping. */
+  private pollChain: Promise<void> = Promise.resolve();
+
   /** Durable store for the listener's position (optional). */
   private readonly store?: CheckpointStore;
 
@@ -517,6 +536,12 @@ export class ContractEventListener {
     if (!checkpoint) return false;
 
     this.cursor = Math.max(this.config.startLedger, checkpoint.nextLedger);
+    // The paging cursor only applies while the checkpoint's position wins.
+    const eventCursor = checkpoint.metadata?.[EVENT_CURSOR_KEY];
+    this.pagingCursor =
+      typeof eventCursor === 'string' && checkpoint.nextLedger >= this.config.startLedger
+        ? eventCursor
+        : null;
     this.restoredCheckpoint = checkpoint;
     this.resumedFromLedger = this.cursor;
     return true;
@@ -531,11 +556,10 @@ export class ContractEventListener {
   async persist(): Promise<KeeperCheckpoint | null> {
     if (!this.store) return null;
 
-    const checkpoint = createCheckpoint(
-      this.cursor,
-      this.now(),
-      this.config.checkpointMetadata,
-    );
+    const metadata = this.pagingCursor !== null
+      ? { ...this.config.checkpointMetadata, [EVENT_CURSOR_KEY]: this.pagingCursor }
+      : this.config.checkpointMetadata;
+    const checkpoint = createCheckpoint(this.cursor, this.now(), metadata);
     await this.store.save(checkpoint);
     return checkpoint;
   }
@@ -662,8 +686,12 @@ export class ContractEventListener {
       filter.contractIds = [...this.allowedAddresses];
     }
 
+    const position = this.pagingCursor !== null
+      ? { cursor: this.pagingCursor }
+      : { startLedger: this.cursor };
+
     return {
-      startLedger: this.cursor,
+      ...position,
       filters: [filter],
       limit: this.config.pageSize ?? DEFAULT_PAGE_SIZE,
     };
@@ -707,7 +735,7 @@ export class ContractEventListener {
       }
     }
 
-    this.advanceCursor(events.length, highestEventLedger, latestLedger);
+    this.advanceCursor(events, highestEventLedger, latestLedger);
   }
 
   /**
@@ -723,17 +751,23 @@ export class ContractEventListener {
    *   ledger after the highest event actually consumed. Jumping to the head
    *   here would silently skip the events that did not fit on the page —
    *   exactly the events a keeper misses when it comes back from a long
-   *   outage.
+   *   outage. When the RPC supplied event ids, the listener also keeps the
+   *   last id as a paging cursor and continues strictly after it, because
+   *   the rest of the last ledger's events may not have fit on the page
+   *   either.
    *
    * The cursor never moves backwards.
    */
   private advanceCursor(
-    eventCount: number,
+    events: RawContractEvent[],
     highestEventLedger: number,
     latestLedger: number,
   ): void {
     const limit = this.config.pageSize ?? DEFAULT_PAGE_SIZE;
-    const drained = eventCount < limit;
+    const drained = events.length < limit;
+
+    const last = events[events.length - 1];
+    this.pagingCursor = !drained && last?.id ? last.id : null;
 
     // When the page was full we only know about the events we consumed; when
     // it was not, the node's head is the authoritative end of the range.
