@@ -1,7 +1,56 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token::TokenClient, unwrap::UnwrapOptimized, Address,
-    Env, Map, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token::TokenClient,
+    Address, Env, Map, Symbol, Vec,
 };
+
+/// Typed failures of the yield vault.
+///
+/// Anticipated invalid inputs - a caller who is not the admin, a deposit below
+/// the configured minimum, a withdrawal that would redeem nothing - fail with
+/// one of these codes instead of an opaque string panic. A caller (or an
+/// off-chain client) can therefore tell the cases apart and handle them.
+#[contracterror]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VaultError {
+    /// The caller is not the stored admin.
+    Unauthorized = 1,
+    /// The vault is paused and refuses state-changing operations.
+    Paused = 2,
+    /// The vault has not been initialized, so its configuration is missing.
+    NotInitialized = 3,
+    /// A deposit leg is below the configured minimum.
+    AmountBelowMinimum = 4,
+    /// Both deposit legs are zero.
+    DepositMustBePositive = 5,
+    /// The deposit is too small: it would mint zero shares.
+    DepositTooSmall = 6,
+    /// The deposit minted fewer shares than the caller's `min_shares`.
+    InsufficientSharesReceived = 7,
+    /// The requested share amount is not positive.
+    SharesMustBePositive = 8,
+    /// The requested withdrawal is below the configured minimum shares.
+    WithdrawalBelowMinimum = 9,
+    /// The caller holds fewer shares than the withdrawal asks for.
+    InsufficientShares = 10,
+    /// The vault has no shares outstanding, so there is nothing to price against.
+    NoSharesOutstanding = 11,
+    /// A partial withdrawal would redeem zero tokens.
+    WithdrawalTooSmall = 12,
+    /// The redeemed token A is below the caller's `min_amount_a`.
+    InsufficientAmountA = 13,
+    /// The redeemed token B is below the caller's `min_amount_b`.
+    InsufficientAmountB = 14,
+    /// A configured minimum deposit amount is negative.
+    NegativeMinimumDeposit = 15,
+    /// The configured minimum withdrawal must be positive.
+    MinSharesMustBePositive = 16,
+    /// A configured token price is negative.
+    NegativePrice = 17,
+    /// The emergency multisig threshold must be at least 1.
+    ThresholdMustBePositive = 18,
+    /// Fewer authorized emergency signers than the threshold were supplied.
+    InsufficientEmergencySignatures = 19,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,6 +72,36 @@ pub struct UserPosition {
     pub last_harvest: u64,
     pub deposited_amount_a: i128,
     pub deposited_amount_b: i128,
+}
+
+/// Pacing limits applied to withdrawals, expressed in basis points of the
+/// shares held when the current window opened.
+///
+/// Both dimensions are off by default (zero), which preserves the historical
+/// behaviour; an operator enables pacing for a vault that must not be drained
+/// in a single ledger window. Pacing is active when `window_seconds` is
+/// positive and at least one of the two limits is non-zero.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawPacing {
+    /// Maximum share of one user's position (bps) withdrawable per window.
+    pub user_max_bps: u32,
+    /// Maximum share of the vault's total shares (bps) withdrawable per window.
+    pub vault_max_bps: u32,
+    /// Length of the pacing window, in seconds.
+    pub window_seconds: u64,
+}
+
+/// Withdrawal consumption inside one pacing window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawWindow {
+    /// Ledger timestamp that opened the window; 0 means no window yet.
+    pub window_started_at: u64,
+    /// Shares already withdrawn inside this window.
+    pub shares_withdrawn: i128,
+    /// Shares the measured party held when the window opened.
+    pub window_start_shares: i128,
 }
 
 /// An economic-parameter change waiting out its time lock.
@@ -200,7 +279,33 @@ impl YieldVault {
         crate::upgrade::mark_migrated(&env, &admin)
     }
 
-    /// Deposit tokens into the vault
+    /// Deposit tokens into the vault in exchange for vault shares.
+    ///
+    /// # Share Calculation & Rounding Semantics
+    /// - **First Deposit (`total_shares == 0`)**:
+    ///   Mints shares 1:1 with the combined deposited token value (`amount_a + amount_b`).
+    /// - **Subsequent Deposits (`total_shares > 0`)**:
+    ///   Mints shares proportionally to the combined pool assets:
+    ///   `shares = (amount_a + amount_b) * total_shares / total_value`
+    ///   where `total_value = total_amount_a + total_amount_b`.
+    /// - **Rounding Semantics**:
+    ///   Integer arithmetic performs floor truncation (rounds down towards zero).
+    ///   When a deposit's combined on-chain value is too small relative to `total_value`,
+    ///   integer division truncates to zero shares (`shares == 0`). Rather than silently
+    ///   crediting zero shares and absorbing the user's tokens as an uncredited donation,
+    ///   an explicit pre-transfer guard rejects the transaction before any tokens move
+    ///   with the panic message: `"deposit too small: mints zero shares"`.
+    /// - **Slippage Protection**:
+    ///   The depositor can specify `min_shares`. If `shares < min_shares`, the transaction
+    ///   aborts with panic `"insufficient shares received"`.
+    ///
+    /// # Panics
+    /// - If the vault is paused (`"contract is paused"`).
+    /// - If `amount_a` is below the configured minimum deposit (`"amount_a below minimum deposit"`).
+    /// - If `amount_b` is below the configured minimum deposit (`"amount_b below minimum deposit"`).
+    /// - If the combined deposit amount is not positive (`"deposit must be positive"`).
+    /// - If the deposit would mint zero shares (`"deposit too small: mints zero shares"`).
+    /// - If the minted shares are less than `min_shares` (`"insufficient shares received"`).
     pub fn deposit(
         env: Env,
         user: Address,
@@ -213,21 +318,18 @@ impl YieldVault {
         // Reject sub-unit and zero deposits before any tokens move, so a dust
         // deposit can never be used to grief the vault or other depositors.
         let (min_a, min_b) = Self::get_min_deposit_amounts(env.clone());
-        require!(amount_a >= min_a, "amount_a below minimum deposit");
-        require!(amount_b >= min_b, "amount_b below minimum deposit");
-        require!(amount_a + amount_b > 0, "deposit must be positive");
+        require!(&env, amount_a >= min_a, VaultError::AmountBelowMinimum);
+        require!(&env, amount_b >= min_b, VaultError::AmountBelowMinimum);
+        require!(
+            &env,
+            amount_a + amount_b > 0,
+            VaultError::DepositMustBePositive
+        );
 
         let vault_info = Self::get_vault_info(env.clone());
         let mut metrics = Self::get_metrics(env.clone());
 
-        // Transfer tokens from user to vault
-        let token_a_client = TokenClient::new(&env, &vault_info.token_a);
-        let token_b_client = TokenClient::new(&env, &vault_info.token_b);
-
-        token_a_client.transfer(&user, &env.current_contract_address(), &amount_a);
-        token_b_client.transfer(&user, &env.current_contract_address(), &amount_b);
-
-        // Calculate shares based on the combined value of both tokens
+        // Calculate shares based on the combined value of both tokens before transferring tokens.
         let shares = if metrics.total_shares == 0 {
             // First deposit - 1:1 shares per unit of combined deposit value
             amount_a + amount_b
@@ -243,11 +345,18 @@ impl YieldVault {
 
         // A deposit that rounds down to nothing would be a pure donation, so it
         // is rejected instead of silently credited to existing holders.
-        require!(shares > 0, "deposit too small: mints zero shares");
+        require!(&env, shares > 0, VaultError::DepositTooSmall);
 
         if shares < min_shares {
-            panic!("insufficient shares received");
+            panic_with_error!(&env, VaultError::InsufficientSharesReceived);
         }
+
+        // Transfer tokens from user to vault
+        let token_a_client = TokenClient::new(&env, &vault_info.token_a);
+        let token_b_client = TokenClient::new(&env, &vault_info.token_b);
+
+        token_a_client.transfer(&user, &env.current_contract_address(), &amount_a);
+        token_b_client.transfer(&user, &env.current_contract_address(), &amount_b);
 
         // Update user position
         let mut position = Self::get_user_position(env.clone(), user.clone());
@@ -288,10 +397,11 @@ impl YieldVault {
         // Reject zero-share and sub-unit withdrawals before any arithmetic, which
         // also removes the divide-by-zero path when no shares are outstanding.
         let min_withdraw_shares = Self::get_min_withdraw_shares(env.clone());
-        require!(shares > 0, "shares must be positive");
+        require!(&env, shares > 0, VaultError::SharesMustBePositive);
         require!(
+            &env,
             shares >= min_withdraw_shares,
-            "withdrawal below minimum shares"
+            VaultError::WithdrawalBelowMinimum
         );
 
         let vault_info = Self::get_vault_info(env.clone());
@@ -299,10 +409,14 @@ impl YieldVault {
         let mut position = Self::get_user_position(env.clone(), user.clone());
 
         if position.shares < shares {
-            panic!("insufficient shares");
+            panic_with_error!(&env, VaultError::InsufficientShares);
         }
 
-        require!(metrics.total_shares > 0, "no shares outstanding");
+        require!(
+            &env,
+            metrics.total_shares > 0,
+            VaultError::NoSharesOutstanding
+        );
 
         // Calculate withdrawal amounts
         let is_full_exit = shares == position.shares;
@@ -324,8 +438,9 @@ impl YieldVault {
             // A partial exit has to redeem something, otherwise the shares would
             // round-trip to dust.
             require!(
+                &env,
                 withdraw_amount_a > 0 || withdraw_amount_b > 0,
-                "withdrawal too small: redeems zero tokens"
+                VaultError::WithdrawalTooSmall
             );
         }
 
@@ -353,11 +468,15 @@ impl YieldVault {
         let final_amount_b = withdraw_amount_b - fee_amount_b - perf_fee_b;
 
         if final_amount_a < min_amount_a {
-            panic!("insufficient amount A");
+            panic_with_error!(&env, VaultError::InsufficientAmountA);
         }
         if final_amount_b < min_amount_b {
-            panic!("insufficient amount B");
+            panic_with_error!(&env, VaultError::InsufficientAmountB);
         }
+
+        // Pace large exits before any tokens move: a failure here rolls the
+        // whole call back, including the window charge.
+        Self::consume_withdraw_pacing(&env, &user, shares, position.shares, metrics.total_shares);
 
         // Update user position. Withdrawing retires the part of the user's
         // position that was outstanding, so it is also the moment their pending
@@ -543,8 +662,8 @@ impl YieldVault {
         min_b: i128,
     ) -> u64 {
         Self::require_admin(&env, admin.clone());
-        require!(min_a >= 0, "min_amount_a must not be negative");
-        require!(min_b >= 0, "min_amount_b must not be negative");
+        require!(&env, min_a >= 0, VaultError::NegativeMinimumDeposit);
+        require!(&env, min_b >= 0, VaultError::NegativeMinimumDeposit);
 
         Self::enqueue(
             env,
@@ -567,7 +686,7 @@ impl YieldVault {
     /// Returns the id of the queued action.
     pub fn propose_set_min_withdraw_shares(env: Env, admin: Address, min_shares: i128) -> u64 {
         Self::require_admin(&env, admin.clone());
-        require!(min_shares > 0, "min_shares must be positive");
+        require!(&env, min_shares > 0, VaultError::MinSharesMustBePositive);
 
         Self::enqueue(
             env,
@@ -576,12 +695,85 @@ impl YieldVault {
         )
     }
 
+    /// Current withdrawal pacing limits (all zero when pacing is disabled).
+    pub fn get_withdraw_pacing(env: Env) -> WithdrawPacing {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "withdraw_pacing"))
+            .unwrap_or(WithdrawPacing {
+                user_max_bps: 0,
+                vault_max_bps: 0,
+                window_seconds: 0,
+            })
+    }
+
+    /// Set withdrawal pacing limits (admin only). A zero window, or zero limits,
+    /// disables pacing entirely.
+    ///
+    /// A withdrawal is measured against the position held when the current
+    /// window opened, so lowering the limit cannot strand shares that were
+    /// withdrawable when the window began.
+    pub fn set_withdraw_pacing(
+        env: Env,
+        admin: Address,
+        user_max_bps: u32,
+        vault_max_bps: u32,
+        window_seconds: u64,
+    ) {
+        Self::require_admin(&env, admin.clone());
+
+        require!(
+            user_max_bps <= 10000,
+            "user_max_bps must not exceed 10000 bps"
+        );
+        require!(
+            vault_max_bps <= 10000,
+            "vault_max_bps must not exceed 10000 bps"
+        );
+        let enabled = user_max_bps > 0 || vault_max_bps > 0;
+        require!(
+            !enabled || window_seconds > 0,
+            "window_seconds must be positive when pacing is enabled"
+        );
+
+        let pacing = WithdrawPacing {
+            user_max_bps,
+            vault_max_bps,
+            window_seconds,
+        };
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "withdraw_pacing"), &pacing);
+
+        env.events().publish(
+            (Symbol::new(&env, "withdraw_pacing_updated"),),
+            (admin, user_max_bps, vault_max_bps, window_seconds),
+        );
+    }
+
+    /// One user's withdrawal consumption in the current window.
+    pub fn get_user_withdraw_window(env: Env, user: Address) -> WithdrawWindow {
+        Self::get_withdraw_windows(env.clone())
+            .get(user)
+            .unwrap_or(Self::default_withdraw_window())
+    }
+
+    /// Vault-wide withdrawal consumption in the current window.
+    pub fn get_vault_withdraw_window(env: Env) -> WithdrawWindow {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "vault_withdraw_window"))
+            .unwrap_or(Self::default_withdraw_window())
+    }
+
     /// Get vault information
+    ///
+    /// Fails with [`VaultError::NotInitialized`] before `initialize` has run.
     pub fn get_vault_info(env: Env) -> VaultInfo {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "vault_info"))
-            .unwrap_optimized()
+            .unwrap_or_else(|| env.panic_with_error(VaultError::NotInitialized))
     }
 
     /// Get vault metrics, recomputing TVL on the fly from the current balances
@@ -634,6 +826,30 @@ impl YieldVault {
         Self::get_metrics(env).tvl
     }
 
+    /// Set USD prices (scaled) for token_a and token_b (admin only). TVL is
+    /// recomputed immediately so get_tvl reflects the new prices.
+    pub fn set_prices(env: Env, admin: Address, price_a: i128, price_b: i128) {
+        let current_admin = Self::get_admin(env.clone());
+        if admin != current_admin {
+            panic_with_error!(&env, VaultError::Unauthorized);
+        }
+        if price_a < 0 || price_b < 0 {
+            panic_with_error!(&env, VaultError::NegativePrice);
+        }
+
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "price_a"), &price_a);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "price_b"), &price_b);
+
+        let metrics = Self::get_metrics(env.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "metrics"), &metrics);
+    }
+
     /// Queue a change to the USD prices (scaled) used for TVL (admin only).
     ///
     /// Prices are an economic parameter: they change the value backing every
@@ -652,11 +868,13 @@ impl YieldVault {
     }
 
     /// Get treasury address that receives protocol fees
+    ///
+    /// Fails with [`VaultError::NotInitialized`] before `initialize` has run.
     pub fn get_treasury(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "treasury"))
-            .unwrap_optimized()
+            .unwrap_or_else(|| env.panic_with_error(VaultError::NotInitialized))
     }
 
     /// Queue a change to the treasury/DAO address that receives protocol fees
@@ -818,6 +1036,98 @@ impl YieldVault {
         1000i128
     }
 
+    /// A zeroed withdrawal window, used when none has been recorded yet.
+    fn default_withdraw_window() -> WithdrawWindow {
+        WithdrawWindow {
+            window_started_at: 0,
+            shares_withdrawn: 0,
+            window_start_shares: 0,
+        }
+    }
+
+    /// Per-user withdrawal windows, keyed by user address.
+    fn get_withdraw_windows(env: Env) -> Map<Address, WithdrawWindow> {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "withdraw_windows"))
+            .unwrap_or(Map::new(&env))
+    }
+
+    /// Enforce withdrawal pacing and, if the withdrawal is allowed, charge it
+    /// against both the user's and the vault's current window.
+    ///
+    /// `position_shares` and `total_shares` are the balances *before* this
+    /// withdrawal; they size the allowances when a window opens. When pacing is
+    /// disabled (the default) this is a no-op, so unpaced vaults keep their
+    /// previous behaviour.
+    fn consume_withdraw_pacing(
+        env: &Env,
+        user: &Address,
+        shares: i128,
+        position_shares: i128,
+        total_shares: i128,
+    ) {
+        let pacing = Self::get_withdraw_pacing(env.clone());
+        if pacing.window_seconds == 0 || (pacing.user_max_bps == 0 && pacing.vault_max_bps == 0) {
+            return;
+        }
+
+        let now = env.ledger().timestamp();
+        // `window_start_shares` is the "is a window open" flag: it is always
+        // positive when one opened (both parties hold shares here), which keeps
+        // a window opened at ledger timestamp 0 distinct from "no window yet".
+        let window_expired = |window: &WithdrawWindow| {
+            window.window_start_shares == 0
+                || now.saturating_sub(window.window_started_at) >= pacing.window_seconds
+        };
+
+        let mut windows = Self::get_withdraw_windows(env.clone());
+        let mut user_window = windows
+            .get(user.clone())
+            .unwrap_or(Self::default_withdraw_window());
+        if window_expired(&user_window) {
+            user_window.window_started_at = now;
+            user_window.shares_withdrawn = 0;
+            user_window.window_start_shares = position_shares;
+        }
+
+        let mut vault_window = Self::get_vault_withdraw_window(env.clone());
+        if window_expired(&vault_window) {
+            vault_window.window_started_at = now;
+            vault_window.shares_withdrawn = 0;
+            vault_window.window_start_shares = total_shares;
+        }
+
+        // Round the allowance up: a limit expressed in bps must never make a
+        // positive position completely unwithdrawable at small share counts.
+        if pacing.user_max_bps > 0 {
+            let allowance =
+                (user_window.window_start_shares * pacing.user_max_bps as i128 + 9999) / 10000;
+            require!(
+                user_window.shares_withdrawn + shares <= allowance,
+                "withdrawal exceeds per-user pacing limit"
+            );
+        }
+        if pacing.vault_max_bps > 0 {
+            let allowance =
+                (vault_window.window_start_shares * pacing.vault_max_bps as i128 + 9999) / 10000;
+            require!(
+                vault_window.shares_withdrawn + shares <= allowance,
+                "withdrawal exceeds vault pacing limit"
+            );
+        }
+
+        user_window.shares_withdrawn += shares;
+        vault_window.shares_withdrawn += shares;
+        windows.set(user.clone(), user_window);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(env, "withdraw_windows"), &windows);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(env, "vault_withdraw_window"), &vault_window);
+    }
+
     /// The queued timelocked actions, keyed by action id.
     fn get_pending_actions(env: Env) -> Map<u64, PendingAction> {
         env.storage()
@@ -934,11 +1244,13 @@ impl YieldVault {
     }
 
     /// Get admin address
+    ///
+    /// Fails with [`VaultError::NotInitialized`] before `initialize` has run.
     fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&Symbol::new(&env, "admin"))
-            .unwrap_optimized()
+            .unwrap_or_else(|| env.panic_with_error(VaultError::NotInitialized))
     }
 
     /// Check if vault is paused
@@ -952,7 +1264,7 @@ impl YieldVault {
     /// Require vault not paused
     fn require_not_paused(env: &Env) {
         if Self::is_paused(env.clone()) {
-            panic!("vault is paused");
+            env.panic_with_error(VaultError::Paused);
         }
     }
 
@@ -960,7 +1272,7 @@ impl YieldVault {
     pub fn pause(env: Env, admin: Address) {
         let current_admin = Self::get_admin(env.clone());
         if admin != current_admin {
-            panic!("unauthorized");
+            panic_with_error!(&env, VaultError::Unauthorized);
         }
         env.storage()
             .instance()
@@ -973,7 +1285,7 @@ impl YieldVault {
     pub fn unpause(env: Env, admin: Address) {
         let current_admin = Self::get_admin(env.clone());
         if admin != current_admin {
-            panic!("unauthorized");
+            panic_with_error!(&env, VaultError::Unauthorized);
         }
         env.storage()
             .instance()
@@ -986,7 +1298,7 @@ impl YieldVault {
     fn require_admin(env: &Env, caller: Address) {
         let admin = Self::get_admin(env.clone());
         if caller != admin {
-            panic!("unauthorized");
+            env.panic_with_error(VaultError::Unauthorized);
         }
     }
 
@@ -1006,7 +1318,7 @@ impl YieldVault {
     pub fn set_emergency_threshold(env: Env, admin: Address, threshold: u32) {
         Self::require_admin(&env, admin);
         if threshold == 0 {
-            panic!("threshold must be at least 1");
+            panic_with_error!(&env, VaultError::ThresholdMustBePositive);
         }
         env.storage()
             .instance()
@@ -1046,7 +1358,7 @@ impl YieldVault {
         }
 
         if valid < threshold {
-            panic!("insufficient signatures for emergency action");
+            env.panic_with_error(VaultError::InsufficientEmergencySignatures);
         }
     }
 
@@ -1301,6 +1613,67 @@ mod tests {
         assert_eq!(second_shares, 1000);
     }
 
+    /// A deposit that rounds down to zero shares due to integer truncation
+    /// is rejected with a clear panic rather than silently crediting nothing.
+    #[test]
+    fn test_deposit_that_would_mint_zero_shares_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, token_a_client, _, token_a_admin, token_b_admin, user, admin, _) =
+            setup(&env, 0, 0, 0);
+        let dust_user = Address::generate(&env);
+
+        // A large first position makes every later share expensive.
+        token_a_admin.mint(&user, &1_000_000);
+        token_b_admin.mint(&user, &1_000_000);
+        vault.deposit(&user, &1_000_000, &1_000_000, &0);
+
+        // Harvesting raises the value per share above 1, so a 1 unit deposit
+        // now mints 2_000_000 * 1 / 2_002_000 == 0 shares due to integer truncation.
+        vault.harvest(&admin);
+
+        token_a_admin.mint(&dust_user, &1);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.deposit(&dust_user, &1, &0, &0);
+        }));
+
+        assert!(result.is_err(), "a zero-share deposit must be rejected");
+        assert_eq!(vault.get_user_position(&dust_user).shares, 0);
+        // The dust deposit was rejected before transfer, so the balance is untouched.
+        assert_eq!(token_a_client.balance(&dust_user), 1);
+    }
+
+    /// A marginal-but-valid deposit whose share calculation truncates to at least 1 share
+    /// still succeeds and mints the expected non-zero shares.
+    #[test]
+    fn test_marginal_valid_deposit_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, token_a_client, _, token_a_admin, token_b_admin, user, admin, _) =
+            setup(&env, 0, 0, 0);
+        let marginal_user = Address::generate(&env);
+
+        // Establish the same pool state:
+        // total_shares = 2_000_000, total_amount_a = 1_000_000, total_amount_b = 1_000_000
+        token_a_admin.mint(&user, &1_000_000);
+        token_b_admin.mint(&user, &1_000_000);
+        vault.deposit(&user, &1_000_000, &1_000_000, &0);
+
+        // Harvesting raises total_value to 2_002_000 while total_shares remains 2_000_000.
+        vault.harvest(&admin);
+
+        // A marginal deposit of 2 units:
+        // (2 + 0) * 2_000_000 / 2_002_000 = 4_000_000 / 2_002_000 = 1 share.
+        // 1 unit was rejected, but 2 units marginally succeeds with 1 share.
+        token_a_admin.mint(&marginal_user, &2);
+
+        let shares = vault.deposit(&marginal_user, &2, &0, &0);
+        assert_eq!(shares, 1, "marginal deposit of 2 units must mint 1 share");
+        assert_eq!(vault.get_user_position(&marginal_user).shares, 1);
+        assert_eq!(token_a_client.balance(&marginal_user), 0);
+    }
+
     #[test]
     fn test_withdraw_returns_tokens_and_burns_shares() {
         let env = Env::default();
@@ -1412,6 +1785,158 @@ mod tests {
         assert_eq!(token_b_client.balance(&treasury), 10);
         assert_eq!(token_a_client.balance(&admin), 0);
         assert_eq!(token_b_client.balance(&admin), 0);
+    }
+
+    // ============ WITHDRAWAL PACING TESTS (Issue #302) ============
+
+    #[test]
+    fn test_withdraw_pacing_is_disabled_by_default() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, token_a_client, token_b_client, token_a_admin, token_b_admin, user, _, _) =
+            setup(&env, 0, 0, 0);
+
+        let pacing = vault.get_withdraw_pacing();
+        assert_eq!(pacing.user_max_bps, 0);
+        assert_eq!(pacing.vault_max_bps, 0);
+        assert_eq!(pacing.window_seconds, 0);
+
+        mint_pair(
+            &token_a_client,
+            &token_b_client,
+            &token_a_admin,
+            &token_b_admin,
+            &user,
+            1000,
+            1000,
+        );
+        vault.deposit(&user, &1000, &1000, &0);
+
+        // With pacing off the historical behaviour is unchanged: one call can
+        // still close the whole position.
+        vault.withdraw(&user, &2000, &0, &0);
+        assert_eq!(vault.get_user_position(&user).shares, 0);
+    }
+
+    #[test]
+    fn test_user_pacing_limits_an_abrupt_exit() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, token_a_client, token_b_client, token_a_admin, token_b_admin, user, admin, _) =
+            setup(&env, 0, 0, 0);
+
+        env.ledger().set_timestamp(1_000);
+        mint_pair(
+            &token_a_client,
+            &token_b_client,
+            &token_a_admin,
+            &token_b_admin,
+            &user,
+            1000,
+            1000,
+        );
+        vault.deposit(&user, &1000, &1000, &0);
+
+        // At most half of the position may leave per one-hour window.
+        vault.set_withdraw_pacing(&admin, &5000, &0, &3600);
+
+        vault.withdraw(&user, &1000, &0, &0);
+        assert_eq!(vault.get_user_withdraw_window(&user).shares_withdrawn, 1000);
+
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.withdraw(&user, &1000, &0, &0);
+        }));
+        assert!(
+            blocked.is_err(),
+            "a second 50% exit in the same window must be rejected"
+        );
+        assert_eq!(vault.get_user_position(&user).shares, 1000);
+
+        // A fresh window resets the budget: 50% of the remaining 1000 shares.
+        env.ledger().set_timestamp(1_000 + 3601);
+        vault.withdraw(&user, &500, &0, &0);
+        assert_eq!(vault.get_user_position(&user).shares, 500);
+    }
+
+    #[test]
+    fn test_vault_pacing_caps_a_mass_exit() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, token_a_client, token_b_client, token_a_admin, token_b_admin, user, admin, _) =
+            setup(&env, 0, 0, 0);
+        let other = Address::generate(&env);
+
+        mint_pair(
+            &token_a_client,
+            &token_b_client,
+            &token_a_admin,
+            &token_b_admin,
+            &user,
+            1000,
+            1000,
+        );
+        mint_pair(
+            &token_a_client,
+            &token_b_client,
+            &token_a_admin,
+            &token_b_admin,
+            &other,
+            1000,
+            1000,
+        );
+        vault.deposit(&user, &1000, &1000, &0); // 2000 shares
+        vault.deposit(&other, &1000, &1000, &0); // 4000 shares total
+
+        // At most 30% of the vault's shares may leave per one-hour window.
+        vault.set_withdraw_pacing(&admin, &0, &3000, &3600);
+
+        // 25% of the vault leaves with the first user.
+        vault.withdraw(&user, &1000, &0, &0);
+        assert_eq!(vault.get_vault_withdraw_window().shares_withdrawn, 1000);
+
+        // A second 25% would take the window to 50%: constrained to the 30%.
+        let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.withdraw(&other, &1000, &0, &0);
+        }));
+        assert!(blocked.is_err(), "the vault-wide cap must bound mass exits");
+
+        // 5% more fits exactly inside the remaining 5% of the allowance.
+        vault.withdraw(&other, &200, &0, &0);
+        assert_eq!(vault.get_vault_withdraw_window().shares_withdrawn, 1200);
+    }
+
+    #[test]
+    fn test_set_withdraw_pacing_is_admin_only() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, ..) = setup(&env, 0, 0, 0);
+        let stranger = Address::generate(&env);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.set_withdraw_pacing(&stranger, &5000, &0, &3600);
+        }));
+
+        assert!(result.is_err(), "pacing limits must be admin only");
+        assert_eq!(vault.get_withdraw_pacing().user_max_bps, 0);
+    }
+
+    #[test]
+    fn test_set_withdraw_pacing_validates_limits() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _, _, _, _, _, admin, _) = setup(&env, 0, 0, 0);
+
+        // Above 100% is not a meaningful limit.
+        let too_high = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.set_withdraw_pacing(&admin, &10001, &0, &3600);
+        }));
+        assert!(too_high.is_err());
+
+        // An enabled limit needs a window to apply over.
+        let no_window = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vault.set_withdraw_pacing(&admin, &0, &5000, &0);
+        }));
+        assert!(no_window.is_err());
     }
 
     #[test]
