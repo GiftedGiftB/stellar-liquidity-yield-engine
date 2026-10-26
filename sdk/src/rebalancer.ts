@@ -1,3 +1,4 @@
+import { EventEmitter } from 'events';
 import {
   Address,
   Contract,
@@ -8,6 +9,7 @@ import {
   Networks,
   BASE_FEE,
   xdr,
+  nativeToScVal,
   scValToNative,
 } from "stellar-sdk";
 import {
@@ -361,6 +363,7 @@ export class RebalancerClient extends EventEmitter {
           },
         )
           .addOperation(this.contract.call("get_history", limit.toString()))
+          .setTimeout(30)
           .build(),
       );
 
@@ -373,6 +376,89 @@ export class RebalancerClient extends EventEmitter {
       throw new RebalanceError(
         `Failed to get history: ${error.message}`,
         "GET_HISTORY_ERROR",
+      );
+    }
+  }
+
+  /**
+   * Fetch one bounded page of rebalance history in chronological order.
+   * `offset` is the zero-based index of the first history entry.
+   */
+  async getHistoryPage(limit: number = 100, offset: number = 0): Promise<RebalanceHistory[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new RebalanceError('History page limit must be an integer between 1 and 1000', 'INVALID_PAGINATION');
+    }
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 0xffff_ffff) {
+      throw new RebalanceError('History page offset must be a u32 integer', 'INVALID_PAGINATION');
+    }
+
+    try {
+      const result: any = await this.server.simulateTransaction(
+        new TransactionBuilder(
+          await this.server.getAccount(
+            'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+          ),
+          {
+            fee: BASE_FEE,
+            networkPassphrase: this.getNetworkPassphrase(),
+          },
+        )
+          .addOperation(
+            this.contract.call(
+              'get_history_paginated',
+              nativeToScVal(limit, { type: 'u32' }),
+              nativeToScVal(offset, { type: 'u32' }),
+            ),
+          )
+          .setTimeout(30)
+          .build(),
+      );
+
+      if (result.result?.status !== 'SUCCESS') {
+        throw new Error('Failed to get history page');
+      }
+
+      return this.parseHistory(result.result.returnValue);
+    } catch (error: any) {
+      if (error instanceof RebalanceError && error.code === 'INVALID_PAGINATION') throw error;
+      throw new RebalanceError(
+        `Failed to get history page: ${error.message}`,
+        'GET_HISTORY_PAGE_ERROR',
+      );
+    }
+  }
+
+  /** Return the total number of rebalance history entries for pagination UI. */
+  async getHistoryCount(): Promise<number> {
+    try {
+      const result: any = await this.server.simulateTransaction(
+        new TransactionBuilder(
+          await this.server.getAccount(
+            'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+          ),
+          {
+            fee: BASE_FEE,
+            networkPassphrase: this.getNetworkPassphrase(),
+          },
+        )
+          .addOperation(this.contract.call('get_history_count'))
+          .setTimeout(30)
+          .build(),
+      );
+
+      if (result.result?.status !== 'SUCCESS') {
+        throw new Error('Failed to get history count');
+      }
+
+      const count = Number(scValToNative(result.result.returnValue));
+      if (!Number.isSafeInteger(count) || count < 0) {
+        throw new Error('Contract returned an invalid history count');
+      }
+      return count;
+    } catch (error: any) {
+      throw new RebalanceError(
+        `Failed to get history count: ${error.message}`,
+        'GET_HISTORY_COUNT_ERROR',
       );
     }
   }
